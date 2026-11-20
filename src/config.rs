@@ -456,7 +456,8 @@ impl LiveSubtitleStyle {
 #[serde(default)]
 pub struct OverlayConfig {
     pub live_style: LiveSubtitleStyle,
-    pub show_previous_line: bool,
+    pub max_lines: usize,
+    pub smooth_scroll: bool,
     pub min_display_sec: f32,
     pub visible: bool,
     pub click_through: bool,
@@ -475,7 +476,8 @@ impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
             live_style: LiveSubtitleStyle::PrefixLockedFill,
-            show_previous_line: true,
+            max_lines: 3,
+            smooth_scroll: true,
             min_display_sec: 1.20,
             visible: true,
             click_through: false,
@@ -665,6 +667,7 @@ pub fn load_config() -> AppConfig {
     cfg.audio_vad.interim_interval_sec = cfg.audio_vad.interim_interval_sec.clamp(0.25, 5.0);
     cfg.overlay.bg_opacity_pct = cfg.overlay.bg_opacity_pct.clamp(0.0, 100.0);
     cfg.overlay.border_radius = cfg.overlay.border_radius.clamp(0.0, 36.0);
+    cfg.overlay.max_lines = cfg.overlay.max_lines.clamp(1, 4);
     cfg.overlay.min_display_sec = cfg.overlay.min_display_sec.clamp(0.0, 5.0);
     cfg.overlay.auto_hide_sec = cfg.overlay.auto_hide_sec.clamp(0.0, 120.0);
     cfg.overlay.hide_duration_ms = cfg.overlay.hide_duration_ms.clamp(50, 2000);
@@ -1049,5 +1052,26 @@ mod tests {
         )
         .expect("Parakeet TDT v3 preset");
         assert_eq!(en_v3.arch, AsrArch::NemoTransducer { feature_dim: 128 });
+    }
+
+    #[test]
+    fn default_overlay_scroll_crawl_and_legacy_json_upgrade() {
+        let ov = OverlayConfig::default();
+        assert_eq!(ov.live_style, LiveSubtitleStyle::PrefixLockedFill);
+        assert_eq!(ov.max_lines, 3);
+        assert!(ov.smooth_scroll);
+        assert_eq!(ov.min_display_sec, 1.20);
+
+        let legacy_json = r#"{
+            "overlay": {
+                "live_style": "PrefixLockedFill",
+                "show_previous_line": true,
+                "min_display_sec": 1.2
+            }
+        }"#;
+        let parsed: AppConfig = serde_json::from_str(legacy_json).expect("legacy JSON upgrades cleanly");
+        assert_eq!(parsed.overlay.max_lines, 3);
+        assert!(parsed.overlay.smooth_scroll);
+        assert_eq!(parsed.overlay.min_display_sec, 1.2);
     }
 }

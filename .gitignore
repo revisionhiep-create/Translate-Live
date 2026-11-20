@@ -17,8 +17,9 @@
 settings.json
 transcripts/
 
-# Compiled Windows binaries & debug symbols (publish via GitHub Releases instead)
+# Compiled Windows binaries & debug symbols (keep root standalone Translate-Live.exe tracked)
 *.exe
+!Translate-Live.exe
 *.pdb
 
 # Logs & OS metadata

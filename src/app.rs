@@ -47,7 +47,7 @@ const MAIN_MIN_W: i32 = 500;
 const MAIN_MIN_H: i32 = 580;
 
 const OVERLAY_DEFAULT_W: i32 = 820;
-const OVERLAY_DEFAULT_H: i32 = 170;
+const OVERLAY_DEFAULT_H: i32 = 196;
 const OVERLAY_MIN_W: i32 = 260;
 const OVERLAY_MIN_H: i32 = 72;
 
@@ -1203,7 +1203,7 @@ impl eframe::App for TranslateLiveApp {
                 interim_confirmed_bytes,
                 self.config.overlay.live_style,
                 shows_tl,
-                self.config.overlay.show_previous_line,
+                self.config.overlay.max_lines,
                 self.config.overlay.min_display_sec,
             );
             pending_hold_transition = pending;
@@ -2909,10 +2909,26 @@ impl TranslateLiveApp {
             });
 
             ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Visible translations:")
+                        .size(12.0)
+                        .color(theme.text_muted),
+                );
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut self.config.overlay.max_lines)
+                            .range(1..=4)
+                            .speed(0.1),
+                    )
+                    .changed()
+                {
+                    ov_changed = true;
+                }
+                ui.add_space(10.0);
                 if ui
                     .checkbox(
-                        &mut self.config.overlay.show_previous_line,
-                        egui::RichText::new("Pin finished sentence on top (live below)")
+                        &mut self.config.overlay.smooth_scroll,
+                        egui::RichText::new("Smooth scroll-up")
                             .size(12.0)
                             .color(theme.text_primary),
                     )
@@ -2920,7 +2936,7 @@ impl TranslateLiveApp {
                 {
                     ov_changed = true;
                 }
-                ui.add_space(12.0);
+                ui.add_space(10.0);
                 ui.label(
                     egui::RichText::new("Min read time (s):")
                         .size(12.0)
@@ -2941,7 +2957,7 @@ impl TranslateLiveApp {
 
             ui.label(
                 egui::RichText::new(
-                    "Finished sentences pin cleanly on top while the next sentence translates live below (Prefix-Locked locks agreed words in solid white); Min read time protects the top sentence when sentences finish back-to-back (0 = off).",
+                    "Shows up to 3–4 recent translations that smoothly glide up and gently recede as new speech translates live below (zero flash when finalizing); Min read time paces rapid back-to-back sentences (0 = off).",
                 )
                 .size(11.0)
                 .color(theme.text_muted),

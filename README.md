@@ -6,6 +6,33 @@ Capture live Windows system audio (WASAPI loopback + optional mic), transcribe J
 
 ---
 
+## Download & Quick Start (Windows 10 / 11 x64)
+
+### 1. Download `Translate-Live.exe`
+- **Direct Download:** [**Download `Translate-Live.exe` (~71 MB)**](https://github.com/revisionhiep-create/Translate-Live/raw/main/Translate-Live.exe)
+  - Or click **`Translate-Live.exe`** in the repository file list above and choose **Download raw file**.
+- Place `Translate-Live.exe` inside its own folder (for example `C:\Translate-Live\Translate-Live.exe`). No installer, Python, Conda, Ollama, or external DLL runtime is needed.
+- **Windows SmartScreen note:** Because the open-source binary is unsigned, Windows Defender SmartScreen may show a prompt on first launch — click **More info** → **Run anyway**.
+
+### 2. Download Models (First Run)
+No AI models are bundled on startup:
+1. Launch `Translate-Live.exe`.
+2. Under **Shared Model Storage Folder**, keep `<exe_dir>\models` (created automatically on first download) or click **Browse...** to choose another drive/folder.
+3. Choose a **Voice Capture (ASR)** preset matching the stream language (default: **Parakeet TDT-CTC 0.6B (JA)**, or **Paraformer / FireRedASR2** for Chinese, **Zipformer Korean**, **SenseVoice Small** multilingual, etc.) and click **Download Model**.
+4. Under **Translation (LLM)**, keep the default **Qwen3.5-4B Uncensored Q4_K_M** (or choose the lighter **Qwen2.5-3B**) and click **Download Model**.
+
+### 3. Translate Any Live Stream or VOD
+1. Check **Audio & VAD**: leave **Loopback Device** on your default playback output (`Windows Default Output`) to capture any browser, VOD, media player, or game audio, and pick the **Source Language** (`ja`, `ko`, `zh`, `yue`, `en`, or `auto`) and **Target Language** (`en` default).
+2. Drag the transparent **Subtitle Overlay** into position and drag any edge/corner to resize it (window positions save per-monitor automatically).
+3. Toggle **Live Capture** (or press **`F8`**) — translations will stream live at the bottom and smoothly scroll up (`3` recent lines visible by default).
+4. Press **`F10`** to toggle **Click-Through** mode so clicks pass straight through the subtitle window to your video or game; press **`F9`** anytime to show/hide the overlay.
+
+### System Requirements
+- **OS:** Windows 10 or Windows 11 (64-bit)
+- **GPU (Recommended):** DirectX/Vulkan-capable GPU with ~4 GB VRAM for the default 4B Q4_K_M translator (falls back automatically to CPU if Vulkan is unavailable).
+
+---
+
 ## Key Features
 
 - **Single Self-Contained Windows Executable (`Translate-Live.exe`)**:
@@ -22,11 +49,11 @@ Capture live Windows system audio (WASAPI loopback + optional mic), transcribe J
   8. `Parakeet TDT 0.6B v3 (EN + 25 EU)` — `csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8`
   9. `SenseVoice Small (JA / KO / ZH / YUE / EN)` — `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17`
   - Plus a **Custom Hugging Face Link...** option in both ASR and LLM selectors supporting custom HF repos, `/resolve/`, `/blob/`, and `.tar.bz2` archive URLs.
-- **VTuber & Noisy Gaming Stream VAD + Graceful Live Subtitles**:
+- **VTuber & Noisy Gaming Stream VAD + 3-Line Smooth Scroll-Up Subtitles**:
   - Pre-tuned out of the box for foreground streamer speech over game BGM/SFX (`Silero 62%` threshold, `2.5%` foreground Energy Threshold gate active in both VAD modes, `Adaptive` silence `0.70 s`, `0.30 s–6.50 s` speech window, `0.65 s` live fill cadence).
 - **Local Uncensored GPU LLM Translation (`llama.cpp` Vulkan)**:
   - Default: `Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`
-  - Uses `LocalAgreement` forced-prefix locking (solid confirmed words + softer dimmed live tail) in **Smooth Live Fill** mode, or zero-flicker **Clean Sentences Only** mode, with default **Pinned Top Finished Sentence + Live Translation Below** layout (protecting the top finished sentence with configurable Min Read Time), instant interim→final promotion, and DRY/repetition penalties.
+  - Uses `LocalAgreement` forced-prefix locking (solid confirmed words + softer dimmed live tail) in **Smooth Live Fill** mode, or zero-flicker **Clean Sentences Only** mode, with **3-Line Smooth Scroll-Up** crawl (older translations glide smoothly upward and gently recede with zero flash on finalize), `1.20 s` rapid-burst min read time, and DRY/repetition penalties.
 - **Native Transparent Direct2D/DirectWrite Subtitle Overlay**:
   - Movable and edge-resizable over streams, games, and video players.
   - Real-time opacity (`0%–100%`), background color, corner radius, optional background image, click-through mode, top-most toggle, auto-hide fade timer, and customizable multi-line typography/outline/alignment.
