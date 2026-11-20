@@ -22,10 +22,21 @@ No AI models are bundled on startup:
 4. Under **Translation (LLM)**, keep the default **Qwen3.5-4B Uncensored Q4_K_M** (or choose the lighter **Qwen2.5-3B**) and click **Download Model**.
 
 ### 3. Translate Any Live Stream or VOD
-1. Check **Audio & VAD**: leave **Loopback Device** on your default playback output (`Windows Default Output`) to capture any browser, VOD, media player, or game audio, and pick the **Source Language** (`ja`, `ko`, `zh`, `yue`, `en`, or `auto`) and **Target Language** (`en` default).
+1. Check **Audio & VAD**: leave **WASAPI Loopback** on `System Default` to capture your default Windows playback output, or pick a specific channel if you use a virtual mixer (for example, BEACN Mix Create, Voicemeeter, or SteelSeries Sonar may route your browser to `Browser (BEACN Mix Create)` or your active speaker output). Pick the **Source** (`ja`, `ko`, `zh`, `yue`, `en`, or `auto`) and **Target** (`en` default) language.
 2. Drag the transparent **Subtitle Overlay** into position and drag any edge/corner to resize it (window positions save per-monitor automatically).
 3. Toggle **Live Capture** (or press **`F8`**) — translations will stream live at the bottom and smoothly scroll up (`3` recent lines visible by default).
 4. Press **`F10`** to toggle **Click-Through** mode so clicks pass straight through the subtitle window to your video or game; press **`F9`** anytime to show/hide the overlay.
+
+### 4. Tuning Voice Detection (Silero VAD & RMS Thresholds)
+
+![Adjusting the Silero VAD Threshold to match the speaker's audio level](assets/vad-threshold-guide.png)
+
+Watch the live **RMS** (green, left) and **VAD** (gold, right) meters while the speaker is talking in **Audio & VAD** → **VAD Thresholds & Timing**:
+
+- Each meter has a **white vertical tick mark** showing its active threshold: speech triggers translation only when the live bars cross **past (to the right of)** those white markers.
+- **Speaker is too soft or misses words (`VAD` stays below/left of the white line):** Lower **`Silero VAD Threshold (%)`** until the speaker's normal voice reliably pushes the gold **VAD** bar past the white line.
+- **Background music or game SFX triggers false lines:** Raise **`Silero VAD Threshold (%)`** so only clear foreground speech crosses the white line.
+- **Very quiet stream volume (`RMS` stays below its white line):** The green **RMS** bar must also cross the **`Energy Threshold (%)`** tick (`2.5%` default) to filter quiet BGM and faint background voices — lower **`Energy Threshold (%)`** (or set `0.0` to disable it) if your stream volume is turned low.
 
 ### System Requirements
 - **OS:** Windows 10 or Windows 11 (64-bit)
