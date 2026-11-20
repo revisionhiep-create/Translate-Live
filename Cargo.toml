@@ -1,0 +1,66 @@
+[package]
+name = "translate-live"
+version = "1.0.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+anyhow = "1"
+bzip2 = "0.5"
+chrono = "0.4"
+directories = "6"
+eframe = "0.31"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+llama-cpp-2 = { version = "0.1.161", features = ["vulkan"] }
+raw-window-handle = "0.6"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sherpa-onnx = "2.0.2"
+tar = "0.4"
+windows = { version = "0.58", features = [
+    "Foundation_Numerics",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Devices_Properties",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_Graphics_Imaging_D2D",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Console",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[package.metadata.winresource]
+FileDescription = "Translate Live"
+ProductName = "Translate Live"
+OriginalFilename = "Translate-Live.exe"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "symbols"

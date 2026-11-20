@@ -1,0 +1,27 @@
+# Rust build outputs
+/target/
+**/*.rs.bk
+
+# Local model storage & partial downloads
+/models/
+*.gguf
+*.gguf.part
+*.onnx
+*.onnx.part
+*.data
+*.data.part
+*.tar.bz2
+*.part
+
+# Local settings & transcripts
+settings.json
+transcripts/
+
+# Compiled Windows binaries & debug symbols (publish via GitHub Releases instead)
+*.exe
+*.pdb
+
+# Logs & OS metadata
+*.log
+.DS_Store
+Thumbs.db
