@@ -1425,18 +1425,21 @@ mod tests {
 
         let asr_dir = asr_model_dir(&tmp, crate::config::DEFAULT_ASR_URL);
         fs::create_dir_all(&asr_dir).unwrap();
-        fs::write(asr_dir.join("model.int8.onnx.part"), b"partial").unwrap();
+        fs::write(asr_dir.join("encoder.quantized.onnx.part"), b"partial").unwrap();
         assert_eq!(
             inspect_asr_cache(&tmp, crate::config::DEFAULT_ASR_URL),
             CacheStatus::Partial(7)
         );
 
-        fs::remove_file(asr_dir.join("model.int8.onnx.part")).unwrap();
-        fs::write(asr_dir.join("model.int8.onnx"), vec![1u8; 64]).unwrap();
+        fs::remove_file(asr_dir.join("encoder.quantized.onnx.part")).unwrap();
+        fs::write(asr_dir.join("encoder.quantized.onnx"), vec![1u8; 64]).unwrap();
+        fs::write(asr_dir.join("encoder.data"), vec![2u8; 32]).unwrap();
+        fs::write(asr_dir.join("decoder.onnx"), vec![3u8; 16]).unwrap();
+        fs::write(asr_dir.join("joiner.onnx"), vec![4u8; 8]).unwrap();
         fs::write(asr_dir.join("tokens.txt"), b"tok").unwrap();
         assert_eq!(
             inspect_asr_cache(&tmp, crate::config::DEFAULT_ASR_URL),
-            CacheStatus::Ready(67)
+            CacheStatus::Ready(123)
         );
 
         let llm_path = llm_model_path(&tmp, crate::config::DEFAULT_LLM_URL);

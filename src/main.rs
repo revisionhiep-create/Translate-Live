@@ -146,7 +146,10 @@ fn run_self_test(smoke_only: bool) -> Result<()> {
         downloader::inspect_asr_cache(&model_dir, asr_url),
         downloader::CacheStatus::Ready(_)
     ) {
-        println!("Downloading default Parakeet ASR + Silero VAD...");
+        println!(
+            "Downloading default ASR ({}) + Silero VAD...",
+            config::display_asr_name(asr_url)
+        );
         let cancel = Arc::new(AtomicBool::new(false));
         downloader::download_asr_model(asr_url, &model_dir, true, cancel, |_| {})?;
     }

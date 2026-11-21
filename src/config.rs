@@ -5,9 +5,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_ASR_URL: &str =
-    "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8";
+    "https://huggingface.co/oboroge0/Haas-ja-v1.0-onnx-quantized";
 pub const DEFAULT_LLM_URL: &str =
-    "https://huggingface.co/tencent/HY-MT1.5-7B-GGUF/resolve/main/HY-MT1.5-7B-Q4_K_M.gguf";
+    "https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive/resolve/main/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf";
 pub const SILERO_VAD_URL: &str =
     "https://huggingface.co/csukuangfj/vad/resolve/main/silero_vad.onnx";
 
@@ -33,16 +33,8 @@ pub struct AsrPreset {
 
 pub const ASR_PRESETS: &[AsrPreset] = &[
     AsrPreset {
-        name: "Parakeet TDT-CTC 0.6B (JA)",
-        url: DEFAULT_ASR_URL,
-        arch: AsrArch::NemoCtc,
-        slug: "parakeet-tdt_ctc-0.6b-ja-int8",
-        files: &["model.int8.onnx", "tokens.txt"],
-        subtitle: "Default · Fast Japanese NeMo CTC (~625 MB)",
-    },
-    AsrPreset {
         name: "Haas JA v1.0 (Quantized)",
-        url: "https://huggingface.co/oboroge0/Haas-ja-v1.0-onnx-quantized",
+        url: DEFAULT_ASR_URL,
         arch: AsrArch::NemoTransducer { feature_dim: 128 },
         slug: "haas-ja-v1.0-onnx-quantized",
         files: &[
@@ -52,7 +44,15 @@ pub const ASR_PRESETS: &[AsrPreset] = &[
             "joiner.onnx",
             "tokens.txt",
         ],
-        subtitle: "Japanese FastConformer + KDA TDT (~481 MB)",
+        subtitle: "Default · Japanese FastConformer + KDA TDT (~481 MB)",
+    },
+    AsrPreset {
+        name: "Parakeet TDT-CTC 0.6B (JA)",
+        url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8",
+        arch: AsrArch::NemoCtc,
+        slug: "parakeet-tdt_ctc-0.6b-ja-int8",
+        files: &["model.int8.onnx", "tokens.txt"],
+        subtitle: "Fast Japanese NeMo CTC (~625 MB)",
     },
     AsrPreset {
         name: "ReazonSpeech k2 v2 (Zipformer JA)",
@@ -141,14 +141,14 @@ pub struct LlmPreset {
 
 pub const LLM_PRESETS: &[LlmPreset] = &[
     LlmPreset {
-        name: "HY-MT1.5-7B Q4_K_M (Default)",
+        name: "Qwen3.5-9B Uncensored Q4_K_M (Default)",
         url: DEFAULT_LLM_URL,
-        subtitle: "Best dedicated multilingual translator · 33+ langs (~4.31 GB)",
+        subtitle: "Best uncensored slang, VTubers & rolling context (~5.24 GB)",
     },
     LlmPreset {
-        name: "Qwen3.5-9B Uncensored Q4_K_M",
-        url: "https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive/resolve/main/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf",
-        subtitle: "Best uncensored slang, gaming & rolling context (~5.24 GB)",
+        name: "HY-MT1.5-7B Q4_K_M",
+        url: "https://huggingface.co/tencent/HY-MT1.5-7B-GGUF/resolve/main/HY-MT1.5-7B-Q4_K_M.gguf",
+        subtitle: "Best dedicated multilingual translator · 33+ langs (~4.31 GB)",
     },
     LlmPreset {
         name: "Shisa v2.1 Qwen3-8B Q4_K_M (JA ↔ EN)",
@@ -340,14 +340,14 @@ impl Default for AudioVadConfig {
             asr_threads: default_threads,
             source_lang: "ja".to_string(),
             target_lang: "en".to_string(),
-            context_pairs: 4,
+            context_pairs: 5,
             vad_mode: VadMode::Silero,
-            silero_threshold_pct: 62.0,
-            energy_threshold_pct: 2.5,
-            min_speech_sec: 0.30,
-            max_speech_sec: 6.50,
+            silero_threshold_pct: 20.0,
+            energy_threshold_pct: 1.5,
+            min_speech_sec: 0.25,
+            max_speech_sec: 8.0,
             silence_mode: SilenceMode::Adaptive,
-            silence_dur_sec: 0.70,
+            silence_dur_sec: 0.85,
             incremental_asr: true,
             interim_interval_sec: 0.65,
         }
@@ -450,7 +450,7 @@ pub fn default_subtitle_lines() -> Vec<SubtitleLineConfig> {
             id: 1,
             label: "Original".to_string(),
             source: SubtitleLineSource::Original,
-            visible: true,
+            visible: false,
             font_family: "Yu Gothic UI".to_string(),
             font_size: 16.0,
             color_hex: "#D8D5CF".to_string(),
@@ -1053,9 +1053,10 @@ mod tests {
             ),
             PathBuf::from("C:\\Models\\llm\\qwen.gguf")
         );
+        assert_eq!(ASR_PRESETS[0].url, DEFAULT_ASR_URL);
         assert_eq!(
             asr_model_dir(custom_dir, DEFAULT_ASR_URL),
-            PathBuf::from("C:\\Models\\asr\\parakeet-tdt_ctc-0.6b-ja-int8")
+            PathBuf::from("C:\\Models\\asr\\haas-ja-v1.0-onnx-quantized")
         );
         assert_eq!(
             silero_vad_path(custom_dir),
@@ -1115,13 +1116,16 @@ mod tests {
     #[test]
     fn default_audio_vad_tuned_for_vtuber_gaming_streams() {
         let vad = AudioVadConfig::default();
+        assert_eq!(vad.source_lang, "ja");
+        assert_eq!(vad.target_lang, "en");
+        assert_eq!(vad.context_pairs, 5);
         assert_eq!(vad.vad_mode, VadMode::Silero);
-        assert_eq!(vad.silero_threshold_pct, 62.0);
-        assert_eq!(vad.energy_threshold_pct, 2.5);
-        assert_eq!(vad.min_speech_sec, 0.30);
-        assert_eq!(vad.max_speech_sec, 6.50);
+        assert_eq!(vad.silero_threshold_pct, 20.0);
+        assert_eq!(vad.energy_threshold_pct, 1.5);
+        assert_eq!(vad.min_speech_sec, 0.25);
+        assert_eq!(vad.max_speech_sec, 8.0);
         assert_eq!(vad.silence_mode, SilenceMode::Adaptive);
-        assert_eq!(vad.silence_dur_sec, 0.70);
+        assert_eq!(vad.silence_dur_sec, 0.85);
         assert!(vad.incremental_asr);
         assert_eq!(vad.interim_interval_sec, 0.65);
     }
@@ -1166,6 +1170,9 @@ mod tests {
         assert_eq!(ov.max_lines, 3);
         assert!(ov.smooth_scroll);
         assert_eq!(ov.min_display_sec, 0.75);
+        assert_eq!(ov.lines.len(), 2);
+        assert!(!ov.lines[0].visible);
+        assert!(ov.lines[1].visible);
 
         let legacy_json = r#"{
             "overlay": {

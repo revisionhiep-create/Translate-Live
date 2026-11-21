@@ -18,8 +18,8 @@ Capture live Windows system audio (WASAPI loopback + optional mic), transcribe J
 No AI models are bundled on startup:
 1. Launch `Translate-Live.exe`.
 2. Under **Shared Model Storage Folder**, keep `<exe_dir>\models` (created automatically on first download) or click **Browse...** to choose another drive/folder.
-3. Choose a **Voice Capture (ASR)** preset matching the stream language (default: **Parakeet TDT-CTC 0.6B (JA)**, or **Paraformer / FireRedASR2** for Chinese, **Zipformer Korean**, **SenseVoice Small** multilingual, etc.) and click **Download Model**.
-4. Under **Translation (LLM)**, keep the default **Qwen3.5-4B Uncensored Q4_K_M** (or choose the lighter **Qwen2.5-3B**) and click **Download Model**.
+3. Choose a **Voice Capture (ASR)** preset matching the stream language (default: **Haas JA v1.0 (Quantized)**, or **Parakeet TDT-CTC 0.6B (JA)**, **Paraformer / FireRedASR2** for Chinese, **Zipformer Korean**, **Parakeet TDT v2/v3** for English/EU, **SenseVoice Small** multilingual, etc.) and click **Download Model**.
+4. Under **Translation (LLM)**, keep the default **Qwen3.5-9B Uncensored Q4_K_M** (~5.24 GB), pick a dedicated translator (**HY-MT1.5-7B**, **Shisa v2.1 Qwen3-8B**, **TranslateGemma 12B**), or choose a lighter low-VRAM/CPU option (**Qwen3.5-4B Uncensored**, **HY-MT1.5-1.8B Q8_0**) and click **Download Model**.
 
 ### 3. Translate Any Live Stream or VOD
 1. Check **Audio & VAD**: leave **WASAPI Loopback** on `System Default` to capture your default Windows playback output, or pick a specific channel if you use a virtual mixer (for example, BEACN Mix Create, Voicemeeter, or SteelSeries Sonar may route your browser to `Browser (BEACN Mix Create)` or your active speaker output). Pick the **Source** (`ja`, `ko`, `zh`, `yue`, `en`, or `auto`) and **Target** (`en` default) language.
@@ -36,11 +36,11 @@ Watch the live **RMS** (green, left) and **VAD** (gold, right) meters while the 
 - Each meter has a **white vertical tick mark** showing its active threshold: speech triggers translation only when the live bars cross **past (to the right of)** those white markers.
 - **Speaker is too soft or misses words (`VAD` stays below/left of the white line):** Lower **`Silero VAD Threshold (%)`** until the speaker's normal voice reliably pushes the gold **VAD** bar past the white line.
 - **Background music or game SFX triggers false lines:** Raise **`Silero VAD Threshold (%)`** so only clear foreground speech crosses the white line.
-- **Very quiet stream volume (`RMS` stays below its white line):** The green **RMS** bar must also cross the **`Energy Threshold (%)`** tick (`2.5%` default) to filter quiet BGM and faint background voices — lower **`Energy Threshold (%)`** (or set `0.0` to disable it) if your stream volume is turned low.
+- **Very quiet stream volume (`RMS` stays below its white line):** The green **RMS** bar must also cross the **`Energy Threshold (%)`** tick (`1.5%` default) to filter quiet BGM and faint background voices — lower **`Energy Threshold (%)`** (or set `0.0` to disable it) if your stream volume is turned low, or use the quick **General / YouTube** and **Gaming / BGM Stream** preset buttons in **VAD Thresholds & Timing**.
 
 ### System Requirements
 - **OS:** Windows 10 or Windows 11 (64-bit)
-- **GPU (Recommended):** DirectX/Vulkan-capable GPU with ~4 GB VRAM for the default 4B Q4_K_M translator (falls back automatically to CPU if Vulkan is unavailable).
+- **GPU (Recommended):** DirectX/Vulkan-capable GPU with ~8 GB VRAM recommended for the default 9B Q4_K_M translator (~4 GB VRAM with Qwen3.5-4B, or ~2 GB / CPU with HY-MT1.5-1.8B; falls back automatically to CPU if Vulkan is unavailable).
 
 ---
 
@@ -50,8 +50,8 @@ Watch the live **RMS** (green, left) and **VAD** (gold, right) meters while the 
   - No Python, Conda, Ollama, or external DLL runtime installation required.
   - No models are bundled or downloaded on startup; models download only when you click **Download Model** (saved by default into `<exe_dir>\models` and configurable via **Browse...**).
 - **Zero-Hallucination Local ASR Presets (`sherpa-onnx`)**:
-  1. `Parakeet TDT-CTC 0.6B (JA)` — `csukuangfj/sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8` *(Default)*
-  2. `Haas JA v1.0 (Quantized)` — `oboroge0/Haas-ja-v1.0-onnx-quantized`
+  1. `Haas JA v1.0 (Quantized)` — `oboroge0/Haas-ja-v1.0-onnx-quantized` *(Default)*
+  2. `Parakeet TDT-CTC 0.6B (JA)` — `csukuangfj/sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8`
   3. `ReazonSpeech k2 v2 (Zipformer JA)` — `reazon-research/reazonspeech-k2-v2`
   4. `Paraformer Large (ZH / EN)` — `csukuangfj/sherpa-onnx-paraformer-zh-2024-03-09`
   5. `FireRedASR2 CTC (ZH / EN)` — `csukuangfj2/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25`
@@ -60,11 +60,18 @@ Watch the live **RMS** (green, left) and **VAD** (gold, right) meters while the 
   8. `Parakeet TDT 0.6B v3 (EN + 25 EU)` — `csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8`
   9. `SenseVoice Small (JA / KO / ZH / YUE / EN)` — `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17`
   - Plus a **Custom Hugging Face Link...** option in both ASR and LLM selectors supporting custom HF repos, `/resolve/`, `/blob/`, and `.tar.bz2` archive URLs.
-- **VTuber & Noisy Gaming Stream VAD + 3-Line Smooth Scroll-Up Subtitles**:
-  - Pre-tuned out of the box for foreground streamer speech over game BGM/SFX (`Silero 62%` threshold, `2.5%` foreground Energy Threshold gate active in both VAD modes, `Adaptive` silence `0.70 s`, `0.30 s–6.50 s` speech window, `0.65 s` live fill cadence).
-- **Local Uncensored GPU LLM Translation (`llama.cpp` Vulkan)**:
-  - Default: `Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`
-  - Uses `LocalAgreement` forced-prefix locking (solid confirmed words + softer dimmed live tail) in **Smooth Live Fill** mode, or zero-flicker **Clean Sentences Only** mode, with **3-Line Smooth Scroll-Up** crawl (older translations glide smoothly upward and gently recede with zero flash on finalize), `1.20 s` rapid-burst min read time, and DRY/repetition penalties.
+- **VTuber & Live Stream VAD + 3-Line Smooth Scroll-Up Subtitles**:
+  - Pre-tuned out of the box for VTuber streams (`Silero 20%` threshold, `1.5%` foreground Energy Threshold gate active in both VAD modes, `Adaptive` silence `0.85 s`, `0.25 s–8.0 s` speech window, `0.65 s` live fill cadence, `5` rolling context pairs, CJK clause-continuation stitching), plus one-click **General / YouTube** and **Gaming / BGM Stream** profile buttons.
+  - Displays the **Translation** line on the overlay by default (the **Original** transcription line can be enabled anytime in **Overlay** settings).
+- **Local GPU LLM Translation (`llama.cpp` Vulkan)**:
+  - Curated GGUF Presets:
+    1. `Qwen3.5-9B Uncensored Q4_K_M` — `HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive` *(Default)*
+    2. `HY-MT1.5-7B Q4_K_M` — `tencent/HY-MT1.5-7B-GGUF`
+    3. `Shisa v2.1 Qwen3-8B Q4_K_M (JA ↔ EN)` — `mradermacher/shisa-v2.1-qwen3-8b-GGUF`
+    4. `TranslateGemma 12B Q4_K_M` — `mradermacher/translategemma-12b-it-GGUF`
+    5. `Qwen3.5-4B Uncensored Q4_K_M (Fast)` — `HauhauCS/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive`
+    6. `HY-MT1.5-1.8B Q8_0 (Ultra-Fast / CPU)` — `tencent/HY-MT1.5-1.8B-GGUF`
+  - Uses model-native prompt formatting and multi-turn rolling conversation context (`5` pairs default), `LocalAgreement` forced-prefix locking during live fill (solid confirmed words + softer dimmed live tail) plus unconstrained full-context final re-translation on utterance completion, zero-flicker **Clean Sentences Only** mode, **3-Line Smooth Scroll-Up** crawl, `0.75 s` min read time, and DRY/repetition penalties.
 - **Native Transparent Direct2D/DirectWrite Subtitle Overlay**:
   - Movable and edge-resizable over streams, games, and video players.
   - Real-time opacity (`0%–100%`), background color, corner radius, optional background image, click-through mode, top-most toggle, auto-hide fade timer, and customizable multi-line typography/outline/alignment.

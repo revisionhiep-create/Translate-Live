@@ -2772,7 +2772,7 @@ impl TranslateLiveApp {
 
             ui.label(
                 egui::RichText::new(
-                    "Defaults tuned for VTuber/gaming streams: Energy Threshold filters quieter background voices/BGM in both VAD modes (0% = off).",
+                    "Defaults tuned for VTuber streams: Energy Threshold filters quieter background voices/BGM in both VAD modes (0% = off).",
                 )
                 .size(11.0)
                 .color(theme.text_muted),
