@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_ASR_URL: &str =
@@ -698,11 +699,18 @@ pub fn save_config_to_path(cfg: &AppConfig, path: &Path) -> Result<()> {
             .with_context(|| format!("Failed to create config dir {}", parent.display()))?;
     }
     let json = serde_json::to_string_pretty(cfg)?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json)
-        .with_context(|| format!("Failed to write temp settings to {}", tmp.display()))?;
-    if path.exists() {
-        let _ = fs::remove_file(path);
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(tmp_os);
+    {
+        let mut f = File::create(&tmp)
+            .with_context(|| format!("Failed to create temp settings at {}", tmp.display()))?;
+        f.write_all(json.as_bytes())
+            .with_context(|| format!("Failed to write temp settings to {}", tmp.display()))?;
+        f.flush()
+            .with_context(|| format!("Failed to flush temp settings to {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("Failed to sync temp settings to {}", tmp.display()))?;
     }
     fs::rename(&tmp, path)
         .with_context(|| format!("Failed to finalize settings at {}", path.display()))?;
@@ -716,18 +724,16 @@ pub fn normalize_hf_url(raw: &str) -> Result<String> {
     if trimmed.is_empty() {
         bail!("Model download link cannot be empty");
     }
-    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
-        bail!("Model download link must start with https:// or http://");
+    if !trimmed.starts_with("https://") {
+        bail!("Model download link must start with https://");
     }
 
     let mut normalized = trimmed.to_string();
-    if let Some(after_scheme) = normalized
-        .strip_prefix("https://")
-        .or_else(|| normalized.strip_prefix("http://"))
-    {
-        let host = after_scheme.split('/').next().unwrap_or("");
-        if host.eq_ignore_ascii_case("huggingface.co")
-            || host.to_ascii_lowercase().ends_with(".huggingface.co")
+    if let Some(after_scheme) = normalized.strip_prefix("https://") {
+        let host = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+        if !host.contains('@')
+            && (host.eq_ignore_ascii_case("huggingface.co")
+                || host.to_ascii_lowercase().ends_with(".huggingface.co"))
         {
             if let Some(idx) = normalized.find("/blob/") {
                 normalized.replace_range(idx..idx + "/blob/".len(), "/resolve/");
@@ -746,23 +752,34 @@ pub fn normalize_asr_url(raw: &str) -> Result<String> {
     Ok(url)
 }
 
+fn is_valid_hf_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg != "."
+        && seg != ".."
+        && !seg
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '\\' | ':' | '\0'))
+}
+
 /// Extracts `(owner, repo)` from a Hugging Face URL such as `https://huggingface.co/owner/repo`
 /// or `https://huggingface.co/owner/repo/tree/main`.
 pub fn parse_hf_repo_id(url: &str) -> Option<(String, String)> {
-    let trimmed = url.trim().trim_end_matches('/');
-    let after_scheme = trimmed
-        .strip_prefix("https://")
-        .or_else(|| trimmed.strip_prefix("http://"))?;
+    let without_frag = url.trim().split('#').next()?;
+    let without_query = without_frag.split('?').next()?;
+    let trimmed = without_query.trim_end_matches('/');
+    let after_scheme = trimmed.strip_prefix("https://")?;
     let mut parts = after_scheme.split('/');
-    let host = parts.next()?;
-    if !(host.eq_ignore_ascii_case("huggingface.co")
-        || host.to_ascii_lowercase().ends_with(".huggingface.co"))
+    let host = parts.next()?.trim();
+    if host.contains('@')
+        || host.chars().any(|c| c.is_whitespace() || c.is_control())
+        || !(host.eq_ignore_ascii_case("huggingface.co")
+            || host.to_ascii_lowercase().ends_with(".huggingface.co"))
     {
         return None;
     }
     let owner = parts.next()?.trim();
     let repo = parts.next()?.trim();
-    if owner.is_empty() || repo.is_empty() {
+    if !is_valid_hf_segment(owner) || !is_valid_hf_segment(repo) {
         return None;
     }
     Some((owner.to_string(), repo.to_string()))
@@ -892,7 +909,7 @@ pub fn resolve_existing_llm_path(models_dir: &Path, normalized_url: &str) -> Opt
 
 pub fn parse_hex_color(hex: &str) -> Option<[u8; 3]> {
     let s = hex.trim().trim_start_matches('#');
-    if s.len() != 6 {
+    if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let r = u8::from_str_radix(&s[0..2], 16).ok()?;
@@ -919,6 +936,27 @@ mod tests {
         );
         assert!(normalize_hf_url("").is_err());
         assert!(normalize_hf_url("ftp://example.com/a.gguf").is_err());
+        assert!(normalize_hf_url("http://huggingface.co/a/b/resolve/main/m.gguf").is_err());
+    }
+
+    #[test]
+    fn parse_hf_repo_id_strips_query_and_fragment_and_rejects_traversal() {
+        assert_eq!(
+            parse_hf_repo_id("https://huggingface.co/owner/repo?tab=files"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_hf_repo_id("https://huggingface.co/owner/repo#readme"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_hf_repo_id("https://huggingface.co/owner/repo/tree/main?view=tree#files"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(parse_hf_repo_id("https://huggingface.co/../repo"), None);
+        assert_eq!(parse_hf_repo_id("https://huggingface.co/owner/.."), None);
+        assert_eq!(parse_hf_repo_id("http://huggingface.co/owner/repo"), None);
+        assert_eq!(parse_hf_repo_id("https://evil.com@huggingface.co/owner/repo"), None);
     }
 
     #[test]
@@ -996,6 +1034,9 @@ mod tests {
         assert_eq!(parse_hex_color("#34A853"), Some([0x34, 0xA8, 0x53]));
         assert_eq!(parse_hex_color("1e1e1e"), Some([0x1E, 0x1E, 0x1E]));
         assert_eq!(parse_hex_color("invalid"), None);
+        assert_eq!(parse_hex_color("あい"), None);
+        assert_eq!(parse_hex_color("#日本"), None);
+        assert_eq!(parse_hex_color("+1+2+3"), None);
         assert_eq!(format_hex_color([0x34, 0xA8, 0x53]), "#34A853");
     }
 

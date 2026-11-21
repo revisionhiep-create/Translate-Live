@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use sherpa_onnx::LinearResampler;
 use std::collections::VecDeque;
+use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::core::{GUID, PCWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
@@ -157,8 +158,15 @@ unsafe fn detect_sample_kind(fmt: *const WAVEFORMATEX) -> Result<(SampleKind, u3
         };
     }
     if tag == WAVE_FORMAT_EXTENSIBLE {
-        let ext = &*(fmt as *const WAVEFORMATEXTENSIBLE);
-        let sub = ext.SubFormat;
+        let min_cb = size_of::<WAVEFORMATEXTENSIBLE>() - size_of::<WAVEFORMATEX>();
+        let cb_size = wfx.cbSize;
+        if (cb_size as usize) < min_cb {
+            return Err(anyhow!(
+                "Invalid WAVEFORMATEXTENSIBLE cbSize: {cb_size} < {min_cb}"
+            ));
+        }
+        let ext_ptr = fmt as *const WAVEFORMATEXTENSIBLE;
+        let sub = std::ptr::addr_of!((*ext_ptr).SubFormat).read_unaligned();
         if sub == SUBTYPE_IEEE_FLOAT && bits == 32 {
             return Ok((SampleKind::Float32, sample_rate, channels));
         }
@@ -185,27 +193,46 @@ unsafe fn decode_frames_to_mono(
     out: &mut Vec<f32>,
 ) {
     out.clear();
+    let sample_bytes = match kind {
+        SampleKind::Float32 | SampleKind::Pcm32 => 4usize,
+        SampleKind::Pcm24 => 3usize,
+        SampleKind::Pcm16 => 2usize,
+    };
+    let Some(frame_bytes) = channels.checked_mul(sample_bytes) else {
+        return;
+    };
+    let Some(total_bytes) = num_frames.checked_mul(frame_bytes) else {
+        return;
+    };
+    if data.is_null() || total_bytes == 0 || frame_bytes == 0 {
+        return;
+    }
+
     out.reserve(num_frames);
     let inv_ch = 1.0 / (channels as f32);
+    let bytes = std::slice::from_raw_parts(data, total_bytes);
 
     match kind {
         SampleKind::Float32 => {
-            let slice = std::slice::from_raw_parts(data as *const f32, num_frames * channels);
-            for frame in slice.chunks_exact(channels) {
-                let sum: f32 = frame.iter().copied().sum();
+            for frame in bytes.chunks_exact(frame_bytes) {
+                let sum: f32 = frame
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .sum();
                 out.push((sum * inv_ch).clamp(-1.0, 1.0));
             }
         }
         SampleKind::Pcm16 => {
-            let slice = std::slice::from_raw_parts(data as *const i16, num_frames * channels);
-            for frame in slice.chunks_exact(channels) {
-                let sum: f32 = frame.iter().map(|&s| s as f32 / 32768.0).sum();
+            for frame in bytes.chunks_exact(frame_bytes) {
+                let sum: f32 = frame
+                    .chunks_exact(2)
+                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                    .sum();
                 out.push((sum * inv_ch).clamp(-1.0, 1.0));
             }
         }
         SampleKind::Pcm24 => {
-            let bytes = std::slice::from_raw_parts(data, num_frames * channels * 3);
-            for frame in bytes.chunks_exact(channels * 3) {
+            for frame in bytes.chunks_exact(frame_bytes) {
                 let mut sum = 0.0f32;
                 for s in frame.chunks_exact(3) {
                     let raw = ((s[0] as i32) << 8 | (s[1] as i32) << 16 | (s[2] as i32) << 24) >> 8;
@@ -215,9 +242,11 @@ unsafe fn decode_frames_to_mono(
             }
         }
         SampleKind::Pcm32 => {
-            let slice = std::slice::from_raw_parts(data as *const i32, num_frames * channels);
-            for frame in slice.chunks_exact(channels) {
-                let sum: f32 = frame.iter().map(|&s| (s as f32) / 2_147_483_648.0).sum();
+            for frame in bytes.chunks_exact(frame_bytes) {
+                let sum: f32 = frame
+                    .chunks_exact(4)
+                    .map(|b| (i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32) / 2_147_483_648.0)
+                    .sum();
                 out.push((sum * inv_ch).clamp(-1.0, 1.0));
             }
         }
@@ -248,15 +277,27 @@ unsafe fn open_device_by_id(
         .context("No default Windows audio endpoint available")
 }
 
+struct CoTaskMemGuard(*mut core::ffi::c_void);
+
+impl Drop for CoTaskMemGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                CoTaskMemFree(Some(self.0));
+            }
+        }
+    }
+}
+
 struct WasapiStream {
-    _com: ComGuard,
-    audio_client: IAudioClient,
     capture_client: IAudioCaptureClient,
+    audio_client: IAudioClient,
     kind: SampleKind,
     channels: usize,
     sample_rate: u32,
     bytes_per_frame: usize,
     resampler: Option<LinearResampler>,
+    _com: ComGuard,
 }
 
 impl WasapiStream {
@@ -274,6 +315,7 @@ impl WasapiStream {
             let fmt_ptr = audio_client
                 .GetMixFormat()
                 .context("Failed to query WASAPI mix format")?;
+            let fmt_guard = CoTaskMemGuard(fmt_ptr as _);
             let (kind, sample_rate, channels) = detect_sample_kind(fmt_ptr)?;
             let bits = (*fmt_ptr).wBitsPerSample as usize;
             let bytes_per_frame = channels * (bits / 8);
@@ -291,7 +333,7 @@ impl WasapiStream {
                 fmt_ptr,
                 None,
             );
-            CoTaskMemFree(Some(fmt_ptr as _));
+            drop(fmt_guard);
             res.context("IAudioClient::Initialize failed")?;
 
             let capture_client: IAudioCaptureClient = audio_client
@@ -302,20 +344,23 @@ impl WasapiStream {
                 .context("Failed to start WASAPI capture stream")?;
 
             let resampler = if sample_rate != 16000 {
-                LinearResampler::create(sample_rate as i32, 16000)
+                let rs = LinearResampler::create(sample_rate as i32, 16000).ok_or_else(|| {
+                    anyhow!("Failed to initialize audio resampler ({sample_rate} Hz -> 16000 Hz)")
+                })?;
+                Some(rs)
             } else {
                 None
             };
 
             Ok(Self {
-                _com: com,
-                audio_client,
                 capture_client,
+                audio_client,
                 kind,
                 channels,
                 sample_rate,
                 bytes_per_frame,
                 resampler,
+                _com: com,
             })
         }
     }
@@ -402,10 +447,18 @@ impl AudioCaptureHandle {
                     mic_loop(mic_id, stop_m, ring_m, ready_tx);
                 })
                 .context("Failed to spawn WASAPI mic thread")?;
-            if let Ok(Err(err)) = ready_rx.recv_timeout(Duration::from_secs(3)) {
-                stop_flag.store(true, Ordering::SeqCst);
-                let _ = join.join();
-                return Err(err);
+            match ready_rx.recv_timeout(Duration::from_secs(3)) {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    stop_flag.store(true, Ordering::SeqCst);
+                    let _ = join.join();
+                    return Err(err);
+                }
+                Err(_) => {
+                    stop_flag.store(true, Ordering::SeqCst);
+                    let _ = join.join();
+                    return Err(anyhow!("Timed out opening WASAPI microphone device"));
+                }
             }
             Some(join)
         } else {
@@ -415,7 +468,7 @@ impl AudioCaptureHandle {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let stop_l = Arc::clone(&stop_flag);
         let ring_l = Arc::clone(&mic_ring);
-        let loopback_join = thread::Builder::new()
+        let loopback_join = match thread::Builder::new()
             .name("wasapi-loopback".to_string())
             .spawn(move || {
                 loopback_loop(
@@ -427,8 +480,16 @@ impl AudioCaptureHandle {
                     ready_tx,
                     on_error,
                 );
-            })
-            .context("Failed to spawn WASAPI loopback thread")?;
+            }) {
+            Ok(j) => j,
+            Err(e) => {
+                stop_flag.store(true, Ordering::SeqCst);
+                if let Some(mj) = mic_join {
+                    let _ = mj.join();
+                }
+                return Err(e).context("Failed to spawn WASAPI loopback thread");
+            }
+        };
 
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Ok(())) => {}
@@ -500,7 +561,7 @@ fn mic_loop(
     while !stop_flag.load(Ordering::Relaxed) {
         match stream.read_available_16k(&mut scratch, &mut out_16k) {
             Ok(true) if !out_16k.is_empty() => {
-                let mut ring = mic_ring.lock().unwrap();
+                let mut ring = mic_ring.lock().unwrap_or_else(|e| e.into_inner());
                 if ring.len() > 16000 {
                     let drop_n = ring.len() - 8000;
                     ring.drain(..drop_n);
@@ -542,19 +603,25 @@ fn loopback_loop(
         match stream.read_available_16k(&mut scratch, &mut out_16k) {
             Ok(had_packet) => {
                 // Critical WASAPI loopback silence injection: when playback stops/pauses, Windows
-                // emits zero packets, so inject 10ms (160 samples at 16 kHz) of silence to flush VAD.
-                if !had_packet || out_16k.is_empty() {
+                // emits zero packets, so inject silence sized to actual elapsed sleep to flush VAD
+                // and drain optional mic ring at real-time pace.
+                let injected_silence = !had_packet || out_16k.is_empty();
+                if injected_silence {
+                    let before_sleep = Instant::now();
                     thread::sleep(Duration::from_millis(10));
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
                     }
+                    let elapsed_secs = before_sleep.elapsed().as_secs_f64();
+                    let silence_samples =
+                        ((elapsed_secs * 16_000.0).round() as usize).clamp(160, 1600);
                     out_16k.clear();
-                    out_16k.resize(160, 0.0);
+                    out_16k.resize(silence_samples, 0.0);
                 }
 
                 // Mix optional mic ring samples if available.
                 {
-                    let mut ring = mic_ring.lock().unwrap();
+                    let mut ring = mic_ring.lock().unwrap_or_else(|e| e.into_inner());
                     if !ring.is_empty() {
                         for s in out_16k.iter_mut() {
                             if let Some(m) = ring.pop_front() {
@@ -571,7 +638,7 @@ fn loopback_loop(
                 if tx.send(out_16k.clone()).is_err() {
                     break;
                 }
-                if had_packet {
+                if !injected_silence {
                     thread::sleep(Duration::from_millis(4));
                 }
             }

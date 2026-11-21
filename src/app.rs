@@ -185,6 +185,7 @@ impl CapturePhase {
 
 #[derive(Debug, Clone)]
 struct TranscriptEntry {
+    id: u64,
     timestamp: String,
     original: String,
     translation: String,
@@ -214,15 +215,18 @@ struct SharedState {
     interim_translation: String,
     interim_confirmed_bytes: usize,
     transcript: Vec<TranscriptEntry>,
+    next_transcript_id: u64,
+    total_finalized_count: u64,
+    transcript_version: u64,
     picked_folder: Option<PathBuf>,
     picked_bg_image: Option<PathBuf>,
-    hotkey_revert: Option<(HotkeyTarget, Option<HotkeyBinding>)>,
+    hotkey_revert: Vec<(HotkeyTarget, Option<HotkeyBinding>)>,
     overlay_geometry_update: Option<WindowState>,
     display_changed: bool,
     force_quit: bool,
     cache_refresh_needed: bool,
-    toggle_overlay_requested: bool,
-    toggle_click_through_requested: bool,
+    overlay_sync_visible: Option<bool>,
+    overlay_sync_click_through: Option<bool>,
 }
 
 impl Default for SharedState {
@@ -244,15 +248,18 @@ impl Default for SharedState {
             interim_translation: String::new(),
             interim_confirmed_bytes: 0,
             transcript: Vec::new(),
+            next_transcript_id: 1,
+            total_finalized_count: 0,
+            transcript_version: 0,
             picked_folder: None,
             picked_bg_image: None,
-            hotkey_revert: None,
+            hotkey_revert: Vec::new(),
             overlay_geometry_update: None,
             display_changed: false,
             force_quit: false,
             cache_refresh_needed: true,
-            toggle_overlay_requested: false,
-            toggle_click_through_requested: false,
+            overlay_sync_visible: None,
+            overlay_sync_click_through: None,
         }
     }
 }
@@ -281,14 +288,29 @@ enum CtrlCmd {
     UpdateAudioVad(AudioVadConfig),
     UpdateHotkey(HotkeyTarget, Option<HotkeyBinding>),
     HotkeyEvent(HotkeyEvent),
-    AsrEvent(AsrEvent),
+    ToggleOverlay,
+    ToggleClickThrough,
+    RefreshOverlay,
+    ClearTranscript,
+    AudioFatalError {
+        session_id: u64,
+        error: String,
+    },
+    AsrEvent {
+        session_id: u64,
+        event: AsrEvent,
+    },
     TranslationPartial {
+        session_id: u64,
         utterance_id: u64,
         original: String,
         translation: String,
         confirmed_bytes: usize,
     },
-    TranslationEvent(anyhow::Result<TranslationResult>),
+    TranslationEvent {
+        session_id: u64,
+        result: anyhow::Result<TranslationResult>,
+    },
     ShowWindow,
     Quit,
     ShutdownController,
@@ -474,13 +496,13 @@ pub struct TranslateLiveApp {
     shared_asr_url: Arc<Mutex<String>>,
     shared_llm_url: Arc<Mutex<String>>,
     shared_audio_vad: Arc<Mutex<AudioVadConfig>>,
-    shared_live_style: Arc<Mutex<LiveSubtitleStyle>>,
+    shared_overlay_cfg: Arc<Mutex<OverlayConfig>>,
     shared_show_notifications: Arc<AtomicBool>,
     shared_recording: Arc<AtomicBool>,
     state: Arc<Mutex<SharedState>>,
     ctrl_tx: Sender<CtrlCmd>,
     ctrl_join: Option<JoinHandle<()>>,
-    overlay: Option<OverlayHandle>,
+    overlay: Option<Arc<OverlayHandle>>,
     shell: Option<ShellBridge>,
     hwnd_raw: isize,
     last_saved_main: Option<WindowState>,
@@ -496,9 +518,13 @@ pub struct TranslateLiveApp {
     browsing_image: Arc<AtomicBool>,
     editing_line_id: Option<u64>,
     cache_entries: Vec<CacheEntry>,
-    last_transcript_count: usize,
-    overlay_hold: OverlayDisplayHold,
-    last_overlay_payload: OverlayPayload,
+    ui_transcript: Vec<TranscriptEntry>,
+    ui_transcript_version: u64,
+    ui_total_finalized: u64,
+    last_finalized_seen: u64,
+    cached_status_key: Option<(PathBuf, String, String)>,
+    cached_asr_status: CacheStatus,
+    cached_llm_status: CacheStatus,
 }
 
 impl TranslateLiveApp {
@@ -531,7 +557,7 @@ impl TranslateLiveApp {
         let shared_asr_url = Arc::new(Mutex::new(asr_url_input.clone()));
         let shared_llm_url = Arc::new(Mutex::new(llm_url_input.clone()));
         let shared_audio_vad = Arc::new(Mutex::new(config.audio_vad.clone()));
-        let shared_live_style = Arc::new(Mutex::new(config.overlay.live_style));
+        let shared_overlay_cfg = Arc::new(Mutex::new(config.overlay.clone()));
         let shared_show_notifications = Arc::new(AtomicBool::new(config.show_notifications));
         let shared_recording = Arc::new(AtomicBool::new(false));
         let rms_bits = Arc::new(AtomicU32::new(0.0f32.to_bits()));
@@ -598,7 +624,8 @@ impl TranslateLiveApp {
                 ctx_ov.request_repaint();
             }),
         )
-        .ok();
+        .ok()
+        .map(Arc::new);
 
         if let Some(ws) = overlay.as_ref().and_then(|o| o.current_window_state()) {
             config.overlay_window = Some(ws);
@@ -622,7 +649,7 @@ impl TranslateLiveApp {
                             let _ = tx_shell.send(CtrlCmd::ToggleCapture);
                         }
                         ShellCommand::ToggleOverlay => {
-                            state_shell.lock().unwrap().toggle_overlay_requested = true;
+                            let _ = tx_shell.send(CtrlCmd::ToggleOverlay);
                         }
                         ShellCommand::ShowWindow => {
                             let _ = tx_shell.send(CtrlCmd::ShowWindow);
@@ -668,17 +695,16 @@ impl TranslateLiveApp {
         let asr_c = Arc::clone(&shared_asr_url);
         let llm_c = Arc::clone(&shared_llm_url);
         let av_c = Arc::clone(&shared_audio_vad);
-        let live_style_c = Arc::clone(&shared_live_style);
+        let overlay_cfg_c = Arc::clone(&shared_overlay_cfg);
         let notif_c = Arc::clone(&shared_show_notifications);
         let rms_c = Arc::clone(&rms_bits);
         let vad_c = Arc::clone(&vad_prob_bits);
         let shell_c = shell.clone();
+        let overlay_c = overlay.clone();
         let ctx_c = cc.egui_ctx.clone();
         let init_cap_hk = config.capture_hotkey;
         let init_ov_hk = config.overlay_hotkey;
         let init_ct_hk = config.click_through_hotkey;
-        let ov_hwnd_ref = overlay.as_ref().map(|_| ());
-        let _ = ov_hwnd_ref;
 
         let ctrl_join = thread::Builder::new()
             .name("app-controller".to_string())
@@ -691,13 +717,14 @@ impl TranslateLiveApp {
                     asr_c,
                     llm_c,
                     av_c,
-                    live_style_c,
+                    overlay_cfg_c,
                     notif_c,
                     rms_c,
                     vad_c,
                     llm,
                     hotkey,
                     shell_c,
+                    overlay_c,
                     ctx_c,
                     init_cap_hk,
                     init_ov_hk,
@@ -730,7 +757,7 @@ impl TranslateLiveApp {
             shared_asr_url,
             shared_llm_url,
             shared_audio_vad,
-            shared_live_style,
+            shared_overlay_cfg,
             shared_show_notifications,
             shared_recording,
             state,
@@ -752,9 +779,13 @@ impl TranslateLiveApp {
             browsing_image: Arc::new(AtomicBool::new(false)),
             editing_line_id: None,
             cache_entries: Vec::new(),
-            last_transcript_count: 0,
-            overlay_hold: OverlayDisplayHold::default(),
-            last_overlay_payload: OverlayPayload::default(),
+            ui_transcript: Vec::new(),
+            ui_transcript_version: 0,
+            ui_total_finalized: 0,
+            last_finalized_seen: 0,
+            cached_status_key: None,
+            cached_asr_status: CacheStatus::NotDownloaded,
+            cached_llm_status: CacheStatus::NotDownloaded,
         };
         app.refresh_cache_entries();
         app
@@ -776,6 +807,7 @@ impl TranslateLiveApp {
     fn refresh_cache_entries(&mut self) {
         let dir = self.current_models_dir();
         self.cache_entries = scan_cache_entries(&dir);
+        self.cached_status_key = None;
     }
 
     fn apply_models_dir(&mut self, dir: PathBuf) {
@@ -792,13 +824,14 @@ impl TranslateLiveApp {
     }
 
     fn sync_overlay_config(&self) {
-        *self.shared_live_style.lock().unwrap() = self.config.overlay.live_style;
+        *self.shared_overlay_cfg.lock().unwrap() = self.config.overlay.clone();
         if let Some(ov) = self.overlay.as_ref() {
             ov.set_config(self.config.overlay.clone());
         }
         if let Some(sh) = self.shell.as_ref() {
             sh.set_overlay_visible(self.config.overlay.visible);
         }
+        let _ = self.ctrl_tx.send(CtrlCmd::RefreshOverlay);
     }
 
     fn track_window_geometries(&mut self) {
@@ -1017,13 +1050,43 @@ impl TranslateLiveApp {
     }
 
     fn flush_window_saves(&mut self) {
+        let (sync_vis, sync_ct, reverts) = {
+            let mut s = self.state.lock().unwrap();
+            (
+                s.overlay_sync_visible.take(),
+                s.overlay_sync_click_through.take(),
+                std::mem::take(&mut s.hotkey_revert),
+            )
+        };
+        let mut config_changed = false;
+        if let Some(vis) = sync_vis {
+            if self.config.overlay.visible != vis {
+                self.config.overlay.visible = vis;
+                config_changed = true;
+            }
+        }
+        if let Some(ct) = sync_ct {
+            if self.config.overlay.click_through != ct {
+                self.config.overlay.click_through = ct;
+                config_changed = true;
+            }
+        }
+        for (target, prev) in reverts {
+            match target {
+                HotkeyTarget::Capture => self.config.capture_hotkey = prev,
+                HotkeyTarget::Overlay => self.config.overlay_hotkey = prev,
+                HotkeyTarget::ClickThrough => self.config.click_through_hotkey = prev,
+            }
+            config_changed = true;
+        }
         if let Some(ws) = query_window_state(self.hwnd_raw) {
             self.config.main_window = Some(ws);
         }
         if let Some(ov_ws) = self.overlay.as_ref().and_then(|o| o.current_window_state()) {
             self.config.overlay_window = Some(ov_ws);
         }
-        if self.config.main_window != self.last_saved_main
+        if config_changed
+            || self.config.main_window != self.last_saved_main
             || self.config.overlay_window != self.last_saved_overlay
         {
             self.save_current_config();
@@ -1040,7 +1103,7 @@ impl Drop for TranslateLiveApp {
         if let Some(join) = self.ctrl_join.take() {
             let _ = join.join();
         }
-        if let Some(mut ov) = self.overlay.take() {
+        if let Some(ov) = self.overlay.take() {
             ov.shutdown();
         }
         if let Some(shell) = self.shell.as_ref() {
@@ -1082,25 +1145,24 @@ impl eframe::App for TranslateLiveApp {
             tok_per_sec,
             interim_original,
             interim_translation,
-            interim_confirmed_bytes,
-            transcript,
             picked_folder,
             picked_bg_image,
-            hotkey_revert,
+            hotkey_reverts,
+            overlay_sync_visible,
+            overlay_sync_click_through,
             display_changed,
             cache_refresh,
-            toggle_overlay_req,
-            toggle_ct_req,
         ) = {
             let mut s = self.state.lock().unwrap();
             let cr = s.cache_refresh_needed;
             s.cache_refresh_needed = false;
-            let to = s.toggle_overlay_requested;
-            s.toggle_overlay_requested = false;
-            let tc = s.toggle_click_through_requested;
-            s.toggle_click_through_requested = false;
             let dc = s.display_changed;
             s.display_changed = false;
+            if s.transcript_version != self.ui_transcript_version {
+                self.ui_transcript = s.transcript.clone();
+                self.ui_transcript_version = s.transcript_version;
+                self.ui_total_finalized = s.total_finalized_count;
+            }
             (
                 s.capture_phase.clone(),
                 s.download.clone(),
@@ -1114,15 +1176,13 @@ impl eframe::App for TranslateLiveApp {
                 s.tok_per_sec,
                 s.interim_original.clone(),
                 s.interim_translation.clone(),
-                s.interim_confirmed_bytes,
-                s.transcript.clone(),
                 s.picked_folder.take(),
                 s.picked_bg_image.take(),
-                s.hotkey_revert.take(),
+                std::mem::take(&mut s.hotkey_revert),
+                s.overlay_sync_visible.take(),
+                s.overlay_sync_click_through.take(),
                 dc,
                 cr,
-                to,
-                tc,
             )
         };
 
@@ -1135,82 +1195,36 @@ impl eframe::App for TranslateLiveApp {
         if let Some(folder) = picked_folder {
             self.apply_models_dir(folder);
         }
+        if !hotkey_reverts.is_empty() {
+            for (target, prev) in hotkey_reverts {
+                match target {
+                    HotkeyTarget::Capture => self.config.capture_hotkey = prev,
+                    HotkeyTarget::Overlay => self.config.overlay_hotkey = prev,
+                    HotkeyTarget::ClickThrough => self.config.click_through_hotkey = prev,
+                }
+            }
+            self.save_current_config();
+        }
+        let mut synced_overlay_flags = false;
+        if let Some(vis) = overlay_sync_visible {
+            if self.config.overlay.visible != vis {
+                self.config.overlay.visible = vis;
+                synced_overlay_flags = true;
+            }
+        }
+        if let Some(ct) = overlay_sync_click_through {
+            if self.config.overlay.click_through != ct {
+                self.config.overlay.click_through = ct;
+                synced_overlay_flags = true;
+            }
+        }
+        if synced_overlay_flags {
+            self.save_current_config();
+        }
         if let Some(img_path) = picked_bg_image {
             self.config.overlay.bg_image_path = Some(img_path.to_string_lossy().into_owned());
             self.save_current_config();
             self.sync_overlay_config();
-        }
-        if let Some((target, prev)) = hotkey_revert {
-            match target {
-                HotkeyTarget::Capture => self.config.capture_hotkey = prev,
-                HotkeyTarget::Overlay => self.config.overlay_hotkey = prev,
-                HotkeyTarget::ClickThrough => self.config.click_through_hotkey = prev,
-            }
-            self.save_current_config();
-        }
-        if toggle_overlay_req {
-            self.config.overlay.visible = !self.config.overlay.visible;
-            self.save_current_config();
-            self.sync_overlay_config();
-            if self.config.show_notifications {
-                if let Some(sh) = self.shell.as_ref() {
-                    let body = if self.config.overlay.visible {
-                        "Subtitle overlay shown"
-                    } else {
-                        "Subtitle overlay hidden"
-                    };
-                    sh.notify("Translate Live", body, phase.is_on());
-                }
-            }
-        }
-        if toggle_ct_req {
-            self.config.overlay.click_through = !self.config.overlay.click_through;
-            self.save_current_config();
-            self.sync_overlay_config();
-            if self.config.show_notifications {
-                if let Some(sh) = self.shell.as_ref() {
-                    let body = if self.config.overlay.click_through {
-                        "Overlay click-through enabled"
-                    } else {
-                        "Overlay click-through disabled"
-                    };
-                    sh.notify("Translate Live", body, phase.is_on());
-                }
-            }
-        }
-
-        // Push latest subtitle payload (respecting minimum finalized read time + 2-line history)
-        let mut pending_hold_transition = false;
-        if let Some(ov) = self.overlay.as_ref() {
-            let shows_tl = self
-                .config
-                .overlay
-                .lines
-                .iter()
-                .any(|l| l.visible && l.source == SubtitleLineSource::Translation);
-            let fin_refs: Vec<FinalizedLine<'_>> = transcript
-                .iter()
-                .map(|e| FinalizedLine {
-                    original: &e.original,
-                    translation: &e.translation,
-                })
-                .collect();
-            let (next_payload, pending) = self.overlay_hold.resolve(
-                Instant::now(),
-                &fin_refs,
-                &interim_original,
-                &interim_translation,
-                interim_confirmed_bytes,
-                self.config.overlay.live_style,
-                shows_tl,
-                self.config.overlay.max_lines,
-                self.config.overlay.min_display_sec,
-            );
-            pending_hold_transition = pending;
-            if next_payload != self.last_overlay_payload {
-                self.last_overlay_payload = next_payload.clone();
-                ov.set_payload(next_payload);
-            }
         }
 
         let is_on = phase.is_on();
@@ -1221,7 +1235,7 @@ impl eframe::App for TranslateLiveApp {
             ))));
         }
 
-        if is_on || download.is_some() || phase.is_busy() || benchmarking || pending_hold_transition {
+        if is_on || download.is_some() || phase.is_busy() || benchmarking {
             ctx.request_repaint_after(Duration::from_millis(50));
         } else {
             ctx.request_repaint_after(Duration::from_millis(800));
@@ -1235,8 +1249,18 @@ impl eframe::App for TranslateLiveApp {
         let theme = ThemeColors::for_mode(self.config.dark_mode);
 
         let models_dir = self.current_models_dir();
-        let asr_cache = inspect_asr_cache(&models_dir, &self.asr_url_input);
-        let llm_cache = inspect_llm_cache(&models_dir, &self.llm_url_input);
+        let status_key = (
+            models_dir.clone(),
+            self.asr_url_input.clone(),
+            self.llm_url_input.clone(),
+        );
+        if self.cached_status_key.as_ref() != Some(&status_key) {
+            self.cached_asr_status = inspect_asr_cache(&models_dir, &self.asr_url_input);
+            self.cached_llm_status = inspect_llm_cache(&models_dir, &self.llm_url_input);
+            self.cached_status_key = Some(status_key);
+        }
+        let asr_cache = self.cached_asr_status;
+        let llm_cache = self.cached_llm_status;
 
         egui::CentralPanel::default()
             .frame(
@@ -1350,11 +1374,16 @@ impl eframe::App for TranslateLiveApp {
                                     &theme,
                                     &interim_original,
                                     &interim_translation,
-                                    &transcript,
                                 );
                             }
                             ActiveTab::Cache => {
-                                self.render_cache_tab(ui, &theme, &phase, download.is_some());
+                                self.render_cache_tab(
+                                    ui,
+                                    &theme,
+                                    &phase,
+                                    download.is_some(),
+                                    benchmarking,
+                                );
                             }
                         }
                     });
@@ -1546,7 +1575,7 @@ impl TranslateLiveApp {
                 13.5,
                 cap_label,
                 is_on || matches!(phase, CapturePhase::Loading),
-                !is_busy_cap && !is_downloading,
+                !is_busy_cap && !is_downloading && !benchmarking,
                 is_busy_cap,
             )
             .clicked()
@@ -1755,7 +1784,7 @@ impl TranslateLiveApp {
                 let btn_space = if is_custom_dir { 168.0 } else { 86.0 };
                 let edit_w = (ui.available_width() - btn_space).max(120.0);
                 let dir_resp = ui.add_enabled(
-                    !is_downloading,
+                    !is_downloading && !benchmarking,
                     egui::TextEdit::singleline(&mut self.dir_input)
                         .desired_width(edit_w)
                         .hint_text("Folder to save ASR and LLM models")
@@ -1776,7 +1805,7 @@ impl TranslateLiveApp {
                 let browsing = self.browsing_folder.load(Ordering::Relaxed);
                 if ui
                     .add_enabled(
-                        !is_downloading && !browsing,
+                        !is_downloading && !benchmarking && !browsing,
                         egui::Button::new(
                             egui::RichText::new("Browse...")
                                 .size(11.5)
@@ -1794,7 +1823,7 @@ impl TranslateLiveApp {
                     let state_c = Arc::clone(&self.state);
                     let ctx_c = ctx.clone();
                     let init_dir = self.current_models_dir();
-                    let _ = thread::Builder::new()
+                    if let Err(err) = thread::Builder::new()
                         .name("folder-picker".to_string())
                         .spawn(move || {
                             if let Some(chosen) = pick_folder_dialog(Some(&init_dir)) {
@@ -1802,13 +1831,18 @@ impl TranslateLiveApp {
                             }
                             flag.store(false, Ordering::Relaxed);
                             ctx_c.request_repaint();
-                        });
+                        })
+                    {
+                        self.browsing_folder.store(false, Ordering::Relaxed);
+                        self.state.lock().unwrap().error =
+                            Some(format!("Failed to open folder picker: {err}"));
+                    }
                 }
 
                 if is_custom_dir
                     && ui
                         .add_enabled(
-                            !is_downloading,
+                            !is_downloading && !benchmarking,
                             egui::Button::new(
                                 egui::RichText::new("Reset Default")
                                     .size(11.5)
@@ -1827,10 +1861,10 @@ impl TranslateLiveApp {
         });
 
         // Card 3: Voice Capture (ASR) Model Download Card
-        self.render_asr_model_card(ui, theme, phase, download, asr_cache);
+        self.render_asr_model_card(ui, theme, phase, download, benchmarking, asr_cache);
 
         // Card 4: Translation (LLM) Model Download Card
-        self.render_llm_model_card(ui, theme, phase, download, llm_cache);
+        self.render_llm_model_card(ui, theme, phase, download, benchmarking, llm_cache);
     }
 
     fn render_hotkey_section(&mut self, ui: &mut egui::Ui, theme: &ThemeColors) {
@@ -1971,11 +2005,12 @@ impl TranslateLiveApp {
         theme: &ThemeColors,
         phase: &CapturePhase,
         download: Option<&DownloadState>,
+        benchmarking: bool,
         asr_cache: CacheStatus,
     ) {
         let is_downloading_any = download.is_some();
         let is_downloading_this = download.is_some_and(|d| d.kind == ModelKind::Asr);
-        let locked = is_downloading_any || phase.is_on() || phase.is_busy();
+        let locked = is_downloading_any || phase.is_on() || phase.is_busy() || benchmarking;
 
         card_frame(theme).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -2171,11 +2206,12 @@ impl TranslateLiveApp {
         theme: &ThemeColors,
         phase: &CapturePhase,
         download: Option<&DownloadState>,
+        benchmarking: bool,
         llm_cache: CacheStatus,
     ) {
         let is_downloading_any = download.is_some();
         let is_downloading_this = download.is_some_and(|d| d.kind == ModelKind::Llm);
-        let locked = is_downloading_any || phase.is_on() || phase.is_busy();
+        let locked = is_downloading_any || phase.is_on() || phase.is_busy() || benchmarking;
 
         card_frame(theme).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -2828,7 +2864,6 @@ impl TranslateLiveApp {
         theme: &ThemeColors,
         interim_original: &str,
         interim_translation: &str,
-        transcript: &[TranscriptEntry],
     ) {
         let mut ov_changed = false;
 
@@ -3043,7 +3078,7 @@ impl TranslateLiveApp {
                         let state_c = Arc::clone(&self.state);
                         let ctx_c = ctx.clone();
                         let init_p = self.config.overlay.bg_image_path.clone().map(PathBuf::from);
-                        let _ = thread::Builder::new()
+                        if let Err(err) = thread::Builder::new()
                             .name("image-picker".to_string())
                             .spawn(move || {
                                 if let Some(chosen) = pick_image_file_dialog(init_p.as_deref()) {
@@ -3051,7 +3086,12 @@ impl TranslateLiveApp {
                                 }
                                 flag.store(false, Ordering::Relaxed);
                                 ctx_c.request_repaint();
-                            });
+                            })
+                        {
+                            self.browsing_image.store(false, Ordering::Relaxed);
+                            self.state.lock().unwrap().error =
+                                Some(format!("Failed to open image picker: {err}"));
+                        }
                     }
                 });
             });
@@ -3360,10 +3400,7 @@ impl TranslateLiveApp {
                         )
                         .clicked()
                     {
-                        let mut s = self.state.lock().unwrap();
-                        s.transcript.clear();
-                        s.interim_original.clear();
-                        s.interim_translation.clear();
+                        let _ = self.ctrl_tx.send(CtrlCmd::ClearTranscript);
                     }
                     if ui
                         .checkbox(
@@ -3426,8 +3463,8 @@ impl TranslateLiveApp {
                 let box_bg = egui::Color32::from_rgba_unmultiplied(cr, cg, cb, alpha);
                 let hdr_bg = egui::Color32::from_rgba_unmultiplied(hr, hg, hb, alpha);
                 let fsz = self.config.transcript.font_size;
-                let new_items = transcript.len() != self.last_transcript_count;
-                self.last_transcript_count = transcript.len();
+                let new_items = self.ui_total_finalized != self.last_finalized_seen;
+                self.last_finalized_seen = self.ui_total_finalized;
 
                 egui::Frame::new()
                     .fill(box_bg)
@@ -3445,7 +3482,7 @@ impl TranslateLiveApp {
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "{} utterances captured",
-                                        transcript.len()
+                                        self.ui_total_finalized
                                     ))
                                     .size(11.0)
                                     .color(theme.text_muted),
@@ -3459,14 +3496,14 @@ impl TranslateLiveApp {
                             .auto_shrink([false, false])
                             .stick_to_bottom(self.config.transcript.auto_scroll)
                             .show(ui, |ui| {
-                                if transcript.is_empty() && interim_original.is_empty() {
+                                if self.ui_transcript.is_empty() && interim_original.is_empty() {
                                     ui.label(
                                         egui::RichText::new("Waiting for live speech...")
                                             .size(fsz)
                                             .color(theme.text_muted),
                                     );
                                 }
-                                for entry in transcript {
+                                for entry in &self.ui_transcript {
                                     ui.label(
                                         egui::RichText::new(format!(
                                             "[{}] {}",
@@ -3517,8 +3554,9 @@ impl TranslateLiveApp {
         theme: &ThemeColors,
         phase: &CapturePhase,
         is_downloading: bool,
+        benchmarking: bool,
     ) {
-        let locked = phase.is_on() || phase.is_busy() || is_downloading;
+        let locked = phase.is_on() || phase.is_busy() || is_downloading || benchmarking;
         let models_dir = self.current_models_dir();
         let total_size: u64 = self.cache_entries.iter().map(|e| e.size_bytes).sum();
 
@@ -4323,6 +4361,60 @@ fn apply_theme_visuals(ctx: &egui::Context, dark_mode: bool) {
     });
 }
 
+fn reap_finished(slot: &mut Option<JoinHandle<()>>) -> bool {
+    if slot.as_ref().is_some_and(|j| j.is_finished()) {
+        if let Some(j) = slot.take() {
+            let _ = j.join();
+        }
+    }
+    slot.is_some()
+}
+
+fn push_overlay_now(
+    overlay: &Option<Arc<OverlayHandle>>,
+    shared_overlay_cfg: &Arc<Mutex<OverlayConfig>>,
+    state: &Arc<Mutex<SharedState>>,
+    overlay_hold: &mut OverlayDisplayHold,
+    last_overlay_payload: &mut OverlayPayload,
+) -> bool {
+    let Some(ov) = overlay.as_ref() else {
+        return false;
+    };
+    let ov_cfg = shared_overlay_cfg.lock().unwrap().clone();
+    let shows_tl = ov_cfg
+        .lines
+        .iter()
+        .any(|l| l.visible && l.source == SubtitleLineSource::Translation);
+    let (next_payload, pending) = {
+        let s = state.lock().unwrap();
+        let fin_refs: Vec<FinalizedLine<'_>> = s
+            .transcript
+            .iter()
+            .map(|e| FinalizedLine {
+                id: e.id,
+                original: &e.original,
+                translation: &e.translation,
+            })
+            .collect();
+        overlay_hold.resolve(
+            Instant::now(),
+            &fin_refs,
+            &s.interim_original,
+            &s.interim_translation,
+            s.interim_confirmed_bytes,
+            ov_cfg.live_style,
+            shows_tl,
+            ov_cfg.max_lines,
+            ov_cfg.min_display_sec,
+        )
+    };
+    if next_payload != *last_overlay_payload {
+        *last_overlay_payload = next_payload.clone();
+        ov.set_payload(next_payload);
+    }
+    pending
+}
+
 #[allow(clippy::too_many_arguments)]
 fn controller_loop(
     rx: Receiver<CtrlCmd>,
@@ -4332,13 +4424,14 @@ fn controller_loop(
     shared_asr_url: Arc<Mutex<String>>,
     shared_llm_url: Arc<Mutex<String>>,
     shared_audio_vad: Arc<Mutex<AudioVadConfig>>,
-    shared_live_style: Arc<Mutex<LiveSubtitleStyle>>,
+    shared_overlay_cfg: Arc<Mutex<OverlayConfig>>,
     shared_show_notifications: Arc<AtomicBool>,
     rms_bits: Arc<AtomicU32>,
     vad_prob_bits: Arc<AtomicU32>,
     mut llm: Arc<LlmHandle>,
     mut hotkey: HotkeyController,
     shell: Option<ShellBridge>,
+    overlay: Option<Arc<OverlayHandle>>,
     ctx: egui::Context,
     init_cap_hk: Option<HotkeyBinding>,
     init_ov_hk: Option<HotkeyBinding>,
@@ -4348,8 +4441,12 @@ fn controller_loop(
     if reg_cap_hk.is_some() {
         if let Err(e) = hotkey.set_capture_hotkey(reg_cap_hk) {
             reg_cap_hk = None;
+            if let Some(sh) = shell.as_ref() {
+                sh.set_hotkey_label(String::new());
+                sh.sync_state(false, false);
+            }
             let mut s = state.lock().unwrap();
-            s.hotkey_revert = Some((HotkeyTarget::Capture, None));
+            s.hotkey_revert.push((HotkeyTarget::Capture, None));
             s.error = Some(e.to_string());
         }
     }
@@ -4358,7 +4455,7 @@ fn controller_loop(
         if let Err(e) = hotkey.set_overlay_hotkey(reg_ov_hk) {
             reg_ov_hk = None;
             let mut s = state.lock().unwrap();
-            s.hotkey_revert = Some((HotkeyTarget::Overlay, None));
+            s.hotkey_revert.push((HotkeyTarget::Overlay, None));
             s.error = Some(e.to_string());
         }
     }
@@ -4367,7 +4464,7 @@ fn controller_loop(
         if let Err(e) = hotkey.set_click_through_hotkey(reg_ct_hk) {
             reg_ct_hk = None;
             let mut s = state.lock().unwrap();
-            s.hotkey_revert = Some((HotkeyTarget::ClickThrough, None));
+            s.hotkey_revert.push((HotkeyTarget::ClickThrough, None));
             s.error = Some(e.to_string());
         }
     }
@@ -4386,10 +4483,19 @@ fn controller_loop(
     let mut active_asr: Option<AsrWorkerHandle> = None;
     let mut active_coord: Option<TranslationCoordinator> = None;
     let mut active_av_cfg = shared_audio_vad.lock().unwrap().clone();
+    let mut active_session_id: u64 = 0;
+    let mut overlay_hold = OverlayDisplayHold::default();
+    let mut last_overlay_payload = OverlayPayload::default();
+    let mut pending_hold_transition = false;
+    let mut dl_join: Option<JoinHandle<()>> = None;
+    let mut bench_join: Option<JoinHandle<()>> = None;
+    let shutdown_cancel = Arc::new(AtomicBool::new(false));
 
     let stop_pipeline = |audio: &mut Option<AudioCaptureHandle>,
                          asr: &mut Option<AsrWorkerHandle>,
-                         coord: &mut Option<TranslationCoordinator>| {
+                         coord: &mut Option<TranslationCoordinator>,
+                         session_id_slot: &mut u64| {
+        *session_id_slot = session_id_slot.wrapping_add(1);
         if let Some(mut a) = audio.take() {
             a.stop();
         }
@@ -4404,18 +4510,44 @@ fn controller_loop(
         vad_prob_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
     };
 
-    while let Ok(cmd) = rx.recv() {
+    loop {
+        let cmd = if pending_hold_transition {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(cmd) => cmd,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    pending_hold_transition = push_overlay_now(
+                        &overlay,
+                        &shared_overlay_cfg,
+                        &state,
+                        &mut overlay_hold,
+                        &mut last_overlay_payload,
+                    );
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => break,
+            }
+        };
+
+        let dl_active = reap_finished(&mut dl_join);
+        let bench_active = reap_finished(&mut bench_join);
+
         match cmd {
             CtrlCmd::ToggleCapture => {
-                let (is_on, is_busy, is_dl) = {
+                let (is_on, is_busy, is_dl, is_bench) = {
                     let s = state.lock().unwrap();
                     (
                         s.capture_phase.is_on(),
                         s.capture_phase.is_busy(),
                         s.download.is_some(),
+                        s.benchmarking,
                     )
                 };
-                if is_busy || is_dl {
+                if is_busy || is_dl || is_bench || dl_active || bench_active {
                     continue;
                 }
                 if is_on {
@@ -4437,7 +4569,11 @@ fn controller_loop(
             } => {
                 let can_start = {
                     let s = state.lock().unwrap();
-                    matches!(s.capture_phase, CapturePhase::Off) && s.download.is_none()
+                    matches!(s.capture_phase, CapturePhase::Off)
+                        && s.download.is_none()
+                        && !s.benchmarking
+                        && !dl_active
+                        && !bench_active
                 };
                 if !can_start {
                     continue;
@@ -4472,8 +4608,9 @@ fn controller_loop(
 
                 // Ensure Silero VAD model exists if Silero mode selected
                 if audio_vad.vad_mode == VadMode::Silero && !silero_vad_path(&models_dir).is_file() {
-                    let cancel = Arc::new(AtomicBool::new(false));
-                    if let Err(e) = ensure_silero_vad_only(&models_dir, cancel, |_| {}) {
+                    if let Err(e) =
+                        ensure_silero_vad_only(&models_dir, Arc::clone(&shutdown_cancel), |_| {})
+                    {
                         let mut s = state.lock().unwrap();
                         s.capture_phase = CapturePhase::Off;
                         s.error = Some(format!("Failed to download Silero VAD: {e}"));
@@ -4496,18 +4633,25 @@ fn controller_loop(
                     }
                 };
 
+                active_session_id = active_session_id.wrapping_add(1);
+                let session_id = active_session_id;
+
                 let tx_err = tx.clone();
                 let audio_res = AudioCaptureHandle::start(
                     audio_vad.loopback_device_id.clone(),
                     audio_vad.mic_device_id.clone(),
                     Arc::clone(&rms_bits),
                     Arc::new(move |err| {
-                        let _ = tx_err.send(CtrlCmd::AsrEvent(AsrEvent::Error(err)));
+                        let _ = tx_err.send(CtrlCmd::AudioFatalError {
+                            session_id,
+                            error: err,
+                        });
                     }),
                 );
-                let (audio_handle, audio_rx) = match audio_res {
+                let (mut audio_handle, audio_rx) = match audio_res {
                     Ok(v) => v,
                     Err(e) => {
+                        active_session_id = active_session_id.wrapping_add(1);
                         llm.unload();
                         let mut s = state.lock().unwrap();
                         s.capture_phase = CapturePhase::Off;
@@ -4527,14 +4671,18 @@ fn controller_loop(
                     audio_rx,
                     Arc::clone(&vad_prob_bits),
                     Arc::new(move |ev| {
-                        let _ = tx_asr.send(CtrlCmd::AsrEvent(ev));
+                        let _ = tx_asr.send(CtrlCmd::AsrEvent {
+                            session_id,
+                            event: ev,
+                        });
                         ctx_asr.request_repaint();
                     }),
                 );
                 let asr_handle = match asr_res {
                     Ok(w) => w,
                     Err(e) => {
-                        drop(audio_handle);
+                        active_session_id = active_session_id.wrapping_add(1);
+                        audio_handle.stop();
                         llm.unload();
                         let mut s = state.lock().unwrap();
                         s.capture_phase = CapturePhase::Off;
@@ -4553,6 +4701,7 @@ fn controller_loop(
                     Arc::clone(&llm),
                     Arc::new(move |utterance_id, original, translation, confirmed_bytes| {
                         let _ = tx_tl_p.send(CtrlCmd::TranslationPartial {
+                            session_id,
                             utterance_id,
                             original,
                             translation,
@@ -4561,7 +4710,10 @@ fn controller_loop(
                         ctx_tl_p.request_repaint();
                     }),
                     Arc::new(move |res| {
-                        let _ = tx_tl.send(CtrlCmd::TranslationEvent(res));
+                        let _ = tx_tl.send(CtrlCmd::TranslationEvent {
+                            session_id,
+                            result: res,
+                        });
                         ctx_tl.request_repaint();
                     }),
                 );
@@ -4595,6 +4747,13 @@ fn controller_loop(
                         s.active_asr_name, load_info.model_name
                     );
                 }
+                pending_hold_transition = push_overlay_now(
+                    &overlay,
+                    &shared_overlay_cfg,
+                    &state,
+                    &mut overlay_hold,
+                    &mut last_overlay_payload,
+                );
                 sync_shell(true, false, Some(TaskbarProgress::None));
 
                 if shared_show_notifications.load(Ordering::Relaxed) {
@@ -4617,7 +4776,12 @@ fn controller_loop(
                     s.notice = "Stopping capture & releasing VRAM...".to_string();
                 }
                 sync_shell(false, true, Some(TaskbarProgress::Indeterminate));
-                stop_pipeline(&mut active_audio, &mut active_asr, &mut active_coord);
+                stop_pipeline(
+                    &mut active_audio,
+                    &mut active_asr,
+                    &mut active_coord,
+                    &mut active_session_id,
+                );
                 {
                     let mut s = state.lock().unwrap();
                     s.capture_phase = CapturePhase::Off;
@@ -4628,12 +4792,49 @@ fn controller_loop(
                     s.interim_confirmed_bytes = 0;
                     s.notice = "Ready · VRAM free".to_string();
                 }
+                pending_hold_transition = push_overlay_now(
+                    &overlay,
+                    &shared_overlay_cfg,
+                    &state,
+                    &mut overlay_hold,
+                    &mut last_overlay_payload,
+                );
                 sync_shell(false, false, Some(TaskbarProgress::None));
                 if shared_show_notifications.load(Ordering::Relaxed) {
                     if let Some(sh) = shell.as_ref() {
                         sh.notify("Translate Live — Stopped", "Capture stopped · VRAM free", false);
                     }
                 }
+            }
+            CtrlCmd::AudioFatalError { session_id, error } => {
+                if session_id != active_session_id {
+                    continue;
+                }
+                stop_pipeline(
+                    &mut active_audio,
+                    &mut active_asr,
+                    &mut active_coord,
+                    &mut active_session_id,
+                );
+                {
+                    let mut s = state.lock().unwrap();
+                    s.capture_phase = CapturePhase::Off;
+                    s.interim_utterance_id = 0;
+                    s.last_finalized_utterance_id = 0;
+                    s.interim_original.clear();
+                    s.interim_translation.clear();
+                    s.interim_confirmed_bytes = 0;
+                    s.error = Some(error);
+                    s.notice = "Audio capture stopped due to device error".to_string();
+                }
+                pending_hold_transition = push_overlay_now(
+                    &overlay,
+                    &shared_overlay_cfg,
+                    &state,
+                    &mut overlay_hold,
+                    &mut last_overlay_payload,
+                );
+                sync_shell(false, false, Some(TaskbarProgress::None));
             }
             CtrlCmd::UpdateAudioVad(next_av) => {
                 if next_av.source_lang != active_av_cfg.source_lang
@@ -4646,27 +4847,73 @@ fn controller_loop(
                     asr.update_config(next_av);
                 }
             }
-            CtrlCmd::AsrEvent(ev) => match ev {
-                AsrEvent::Interim {
-                    utterance_id,
-                    text,
-                    asr_ms,
-                } => {
-                    {
-                        let mut s = state.lock().unwrap();
-                        if utterance_id <= s.last_finalized_utterance_id {
-                            continue;
+            CtrlCmd::AsrEvent { session_id, event } => {
+                if session_id != active_session_id {
+                    continue;
+                }
+                match event {
+                    AsrEvent::Interim {
+                        utterance_id,
+                        text,
+                        asr_ms,
+                    } => {
+                        {
+                            let mut s = state.lock().unwrap();
+                            if utterance_id <= s.last_finalized_utterance_id {
+                                continue;
+                            }
+                            s.asr_ms = Some(asr_ms);
+                            if s.interim_utterance_id != utterance_id {
+                                s.interim_utterance_id = utterance_id;
+                                s.interim_translation.clear();
+                                s.interim_confirmed_bytes = 0;
+                            }
+                            s.interim_original = text.clone();
                         }
-                        s.asr_ms = Some(asr_ms);
-                        if s.interim_utterance_id != utterance_id {
-                            s.interim_utterance_id = utterance_id;
-                            s.interim_translation.clear();
-                            s.interim_confirmed_bytes = 0;
+                        pending_hold_transition = push_overlay_now(
+                            &overlay,
+                            &shared_overlay_cfg,
+                            &state,
+                            &mut overlay_hold,
+                            &mut last_overlay_payload,
+                        );
+                        let style = shared_overlay_cfg.lock().unwrap().live_style;
+                        if style == LiveSubtitleStyle::PrefixLockedFill {
+                            if let Some(coord) = active_coord.as_ref() {
+                                coord.submit(TranslateRequest {
+                                    utterance_id,
+                                    text,
+                                    source_lang: active_av_cfg.source_lang.clone(),
+                                    target_lang: active_av_cfg.target_lang.clone(),
+                                    context_pairs: active_av_cfg.context_pairs,
+                                    forced_prefix: None,
+                                    is_final: false,
+                                });
+                            }
                         }
-                        s.interim_original = text.clone();
                     }
-                    let style = *shared_live_style.lock().unwrap();
-                    if style == LiveSubtitleStyle::PrefixLockedFill {
+                    AsrEvent::Final {
+                        utterance_id,
+                        text,
+                        asr_ms,
+                    } => {
+                        {
+                            let mut s = state.lock().unwrap();
+                            s.asr_ms = Some(asr_ms);
+                            if s.interim_utterance_id != utterance_id {
+                                s.interim_utterance_id = utterance_id;
+                                s.interim_translation.clear();
+                                s.interim_confirmed_bytes = 0;
+                            }
+                            s.interim_original = text.clone();
+                        }
+                        pending_hold_transition = push_overlay_now(
+                            &overlay,
+                            &shared_overlay_cfg,
+                            &state,
+                            &mut overlay_hold,
+                            &mut last_overlay_payload,
+                        );
                         if let Some(coord) = active_coord.as_ref() {
                             coord.submit(TranslateRequest {
                                 utterance_id,
@@ -4675,116 +4922,222 @@ fn controller_loop(
                                 target_lang: active_av_cfg.target_lang.clone(),
                                 context_pairs: active_av_cfg.context_pairs,
                                 forced_prefix: None,
-                                is_final: false,
+                                is_final: true,
                             });
                         }
                     }
-                }
-                AsrEvent::Final {
-                    utterance_id,
-                    text,
-                    asr_ms,
-                } => {
-                    {
-                        let mut s = state.lock().unwrap();
-                        s.asr_ms = Some(asr_ms);
-                        if s.interim_utterance_id != utterance_id {
-                            s.interim_utterance_id = utterance_id;
-                            s.interim_translation.clear();
-                            s.interim_confirmed_bytes = 0;
-                        }
-                        s.interim_original = text.clone();
-                    }
-                    if let Some(coord) = active_coord.as_ref() {
-                        coord.submit(TranslateRequest {
-                            utterance_id,
-                            text,
-                            source_lang: active_av_cfg.source_lang.clone(),
-                            target_lang: active_av_cfg.target_lang.clone(),
-                            context_pairs: active_av_cfg.context_pairs,
-                            forced_prefix: None,
-                            is_final: true,
-                        });
+                    AsrEvent::Error(err) => {
+                        state.lock().unwrap().error = Some(err);
                     }
                 }
-                AsrEvent::Error(err) => {
-                    let mut s = state.lock().unwrap();
-                    s.error = Some(err);
-                }
-            },
+            }
             CtrlCmd::TranslationPartial {
+                session_id,
                 utterance_id,
                 original,
                 translation,
                 confirmed_bytes,
             } => {
-                if translation.trim().is_empty() {
+                if session_id != active_session_id || translation.trim().is_empty() {
                     continue;
                 }
-                let mut s = state.lock().unwrap();
-                if utterance_id <= s.last_finalized_utterance_id
-                    || utterance_id < s.interim_utterance_id
-                {
-                    continue;
-                }
-                let same_utt = s.interim_utterance_id == utterance_id;
-                let allow = !same_utt
-                    || s.interim_translation.is_empty()
-                    || translation.chars().count() >= s.interim_translation.chars().count();
-                if allow {
-                    s.interim_confirmed_bytes = if same_utt {
-                        s.interim_confirmed_bytes.max(confirmed_bytes)
+                let updated = {
+                    let mut s = state.lock().unwrap();
+                    if utterance_id <= s.last_finalized_utterance_id
+                        || utterance_id < s.interim_utterance_id
+                    {
+                        false
                     } else {
-                        confirmed_bytes
+                        let same_utt = s.interim_utterance_id == utterance_id;
+                        let allow = !same_utt
+                            || s.interim_translation.is_empty()
+                            || translation.chars().count() >= s.interim_translation.chars().count();
+                        if allow {
+                            s.interim_confirmed_bytes = if same_utt {
+                                s.interim_confirmed_bytes.max(confirmed_bytes)
+                            } else {
+                                confirmed_bytes
+                            }
+                            .min(translation.len());
+                            s.interim_utterance_id = utterance_id;
+                            s.interim_original = original;
+                            s.interim_translation = translation;
+                            true
+                        } else {
+                            false
+                        }
                     }
-                    .min(translation.len());
-                    s.interim_utterance_id = utterance_id;
-                    s.interim_original = original;
-                    s.interim_translation = translation;
+                };
+                if updated {
+                    pending_hold_transition = push_overlay_now(
+                        &overlay,
+                        &shared_overlay_cfg,
+                        &state,
+                        &mut overlay_hold,
+                        &mut last_overlay_payload,
+                    );
                 }
             }
-            CtrlCmd::TranslationEvent(res) => match res {
-                Ok(out) => {
+            CtrlCmd::TranslationEvent { session_id, result } => {
+                if session_id != active_session_id {
+                    continue;
+                }
+                match result {
+                    Ok(out) => {
+                        let accepted = {
+                            let mut s = state.lock().unwrap();
+                            if out.elapsed_ms > 0 {
+                                s.tl_ms = Some(out.elapsed_ms);
+                                s.tok_per_sec = Some(out.tokens_per_sec);
+                            }
+                            if out.is_final {
+                                s.last_finalized_utterance_id =
+                                    s.last_finalized_utterance_id.max(out.utterance_id);
+                                let entry_id = s.next_transcript_id;
+                                s.next_transcript_id = s.next_transcript_id.wrapping_add(1).max(1);
+                                s.total_finalized_count = s.total_finalized_count.saturating_add(1);
+                                s.transcript_version = s.transcript_version.wrapping_add(1);
+                                let ts = Local::now().format("%H:%M:%S").to_string();
+                                s.transcript.push(TranscriptEntry {
+                                    id: entry_id,
+                                    timestamp: ts,
+                                    original: out.original,
+                                    translation: out.translation,
+                                });
+                                if s.transcript.len() > 500 {
+                                    let excess = s.transcript.len() - 500;
+                                    s.transcript.drain(..excess);
+                                }
+                                if s.interim_utterance_id <= out.utterance_id {
+                                    s.interim_original.clear();
+                                    s.interim_translation.clear();
+                                    s.interim_confirmed_bytes = 0;
+                                }
+                                true
+                            } else if out.utterance_id <= s.last_finalized_utterance_id
+                                || out.utterance_id < s.interim_utterance_id
+                            {
+                                false
+                            } else {
+                                s.interim_utterance_id = out.utterance_id;
+                                s.interim_original = out.original;
+                                s.interim_confirmed_bytes =
+                                    out.confirmed_prefix_bytes.min(out.translation.len());
+                                s.interim_translation = out.translation;
+                                true
+                            }
+                        };
+                        if accepted {
+                            pending_hold_transition = push_overlay_now(
+                                &overlay,
+                                &shared_overlay_cfg,
+                                &state,
+                                &mut overlay_hold,
+                                &mut last_overlay_payload,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        state.lock().unwrap().error = Some(err.to_string());
+                    }
+                }
+            }
+            CtrlCmd::ToggleOverlay => {
+                let next_cfg = {
+                    let mut cfg = shared_overlay_cfg.lock().unwrap();
+                    cfg.visible = !cfg.visible;
+                    cfg.clone()
+                };
+                let is_on = {
                     let mut s = state.lock().unwrap();
-                    if out.elapsed_ms > 0 {
-                        s.tl_ms = Some(out.elapsed_ms);
-                        s.tok_per_sec = Some(out.tokens_per_sec);
-                    }
-                    if out.is_final {
-                        s.last_finalized_utterance_id =
-                            s.last_finalized_utterance_id.max(out.utterance_id);
-                        let ts = Local::now().format("%H:%M:%S").to_string();
-                        s.transcript.push(TranscriptEntry {
-                            timestamp: ts,
-                            original: out.original,
-                            translation: out.translation,
-                        });
-                        if s.transcript.len() > 500 {
-                            let excess = s.transcript.len() - 500;
-                            s.transcript.drain(..excess);
-                        }
-                        if s.interim_utterance_id <= out.utterance_id {
-                            s.interim_original.clear();
-                            s.interim_translation.clear();
-                            s.interim_confirmed_bytes = 0;
-                        }
-                    } else {
-                        if out.utterance_id <= s.last_finalized_utterance_id
-                            || out.utterance_id < s.interim_utterance_id
-                        {
-                            continue;
-                        }
-                        s.interim_utterance_id = out.utterance_id;
-                        s.interim_original = out.original;
-                        s.interim_confirmed_bytes =
-                            out.confirmed_prefix_bytes.min(out.translation.len());
-                        s.interim_translation = out.translation;
+                    s.overlay_sync_visible = Some(next_cfg.visible);
+                    s.capture_phase.is_on()
+                };
+                if let Some(ov) = overlay.as_ref() {
+                    ov.set_config(next_cfg.clone());
+                }
+                if let Some(sh) = shell.as_ref() {
+                    sh.set_overlay_visible(next_cfg.visible);
+                    if shared_show_notifications.load(Ordering::Relaxed) {
+                        let body = if next_cfg.visible {
+                            "Subtitle overlay shown"
+                        } else {
+                            "Subtitle overlay hidden"
+                        };
+                        sh.notify("Translate Live", body, is_on);
                     }
                 }
-                Err(err) => {
-                    state.lock().unwrap().error = Some(err.to_string());
+                pending_hold_transition = push_overlay_now(
+                    &overlay,
+                    &shared_overlay_cfg,
+                    &state,
+                    &mut overlay_hold,
+                    &mut last_overlay_payload,
+                );
+                ctx.request_repaint();
+            }
+            CtrlCmd::ToggleClickThrough => {
+                let next_cfg = {
+                    let mut cfg = shared_overlay_cfg.lock().unwrap();
+                    cfg.click_through = !cfg.click_through;
+                    cfg.clone()
+                };
+                let is_on = {
+                    let mut s = state.lock().unwrap();
+                    s.overlay_sync_click_through = Some(next_cfg.click_through);
+                    s.capture_phase.is_on()
+                };
+                if let Some(ov) = overlay.as_ref() {
+                    ov.set_config(next_cfg.clone());
                 }
-            },
+                if shared_show_notifications.load(Ordering::Relaxed) {
+                    if let Some(sh) = shell.as_ref() {
+                        let body = if next_cfg.click_through {
+                            "Overlay click-through enabled"
+                        } else {
+                            "Overlay click-through disabled"
+                        };
+                        sh.notify("Translate Live", body, is_on);
+                    }
+                }
+                pending_hold_transition = push_overlay_now(
+                    &overlay,
+                    &shared_overlay_cfg,
+                    &state,
+                    &mut overlay_hold,
+                    &mut last_overlay_payload,
+                );
+                ctx.request_repaint();
+            }
+            CtrlCmd::RefreshOverlay => {
+                pending_hold_transition = push_overlay_now(
+                    &overlay,
+                    &shared_overlay_cfg,
+                    &state,
+                    &mut overlay_hold,
+                    &mut last_overlay_payload,
+                );
+            }
+            CtrlCmd::ClearTranscript => {
+                {
+                    let mut s = state.lock().unwrap();
+                    s.transcript.clear();
+                    s.interim_original.clear();
+                    s.interim_translation.clear();
+                    s.interim_confirmed_bytes = 0;
+                    s.total_finalized_count = 0;
+                    s.transcript_version = s.transcript_version.wrapping_add(1);
+                }
+                llm.clear_context();
+                pending_hold_transition = push_overlay_now(
+                    &overlay,
+                    &shared_overlay_cfg,
+                    &state,
+                    &mut overlay_hold,
+                    &mut last_overlay_payload,
+                );
+                ctx.request_repaint();
+            }
             CtrlCmd::DownloadModel {
                 kind,
                 url,
@@ -4792,7 +5145,12 @@ fn controller_loop(
             } => {
                 let busy = {
                     let s = state.lock().unwrap();
-                    s.download.is_some() || s.capture_phase.is_on() || s.capture_phase.is_busy()
+                    s.download.is_some()
+                        || s.benchmarking
+                        || s.capture_phase.is_on()
+                        || s.capture_phase.is_busy()
+                        || dl_active
+                        || bench_active
                 };
                 if busy {
                     continue;
@@ -4822,7 +5180,7 @@ fn controller_loop(
                 let ctx_dl = ctx.clone();
                 let cancel_dl = Arc::clone(&cancel);
 
-                let _ = thread::Builder::new()
+                match thread::Builder::new()
                     .name("model-downloader".to_string())
                     .spawn(move || {
                         let emit_prog = |p: DownloadProgress| {
@@ -4887,7 +5245,18 @@ fn controller_loop(
                             sh.sync_state(false, false);
                         }
                         ctx_dl.request_repaint();
-                    });
+                    })
+                {
+                    Ok(j) => dl_join = Some(j),
+                    Err(e) => {
+                        {
+                            let mut s = state.lock().unwrap();
+                            s.download = None;
+                            s.error = Some(format!("Failed to start downloader thread: {e}"));
+                        }
+                        sync_shell(false, false, Some(TaskbarProgress::None));
+                    }
+                }
             }
             CtrlCmd::CancelDownload => {
                 let cancel = state
@@ -4908,7 +5277,13 @@ fn controller_loop(
             } => {
                 {
                     let mut s = state.lock().unwrap();
-                    if s.benchmarking || s.capture_phase.is_on() || s.capture_phase.is_busy() {
+                    if s.benchmarking
+                        || s.download.is_some()
+                        || s.capture_phase.is_on()
+                        || s.capture_phase.is_busy()
+                        || dl_active
+                        || bench_active
+                    {
                         continue;
                     }
                     s.benchmarking = true;
@@ -4922,7 +5297,7 @@ fn controller_loop(
                 let shell_b = shell.clone();
                 let ctx_b = ctx.clone();
 
-                let _ = thread::Builder::new()
+                match thread::Builder::new()
                     .name("bench-runner".to_string())
                     .spawn(move || {
                         let asr_ready =
@@ -5018,7 +5393,18 @@ fn controller_loop(
                             sh.sync_state(false, false);
                         }
                         ctx_b.request_repaint();
-                    });
+                    })
+                {
+                    Ok(j) => bench_join = Some(j),
+                    Err(e) => {
+                        {
+                            let mut s = state.lock().unwrap();
+                            s.benchmarking = false;
+                            s.error = Some(format!("Failed to start benchmark thread: {e}"));
+                        }
+                        sync_shell(false, false, Some(TaskbarProgress::None));
+                    }
+                }
             }
             CtrlCmd::UpdateHotkey(target, next) => {
                 let res = match target {
@@ -5035,8 +5421,16 @@ fn controller_loop(
                                     sh.set_hotkey_label(
                                         next.map(|b| b.display_label()).unwrap_or_default(),
                                     );
-                                    let is_on = state.lock().unwrap().capture_phase.is_on();
-                                    sh.sync_state(is_on, false);
+                                    let (is_on, is_busy) = {
+                                        let s = state.lock().unwrap();
+                                        (
+                                            s.capture_phase.is_on(),
+                                            s.capture_phase.is_busy()
+                                                || s.download.is_some()
+                                                || s.benchmarking,
+                                        )
+                                    };
+                                    sh.sync_state(is_on, is_busy);
                                 }
                             }
                             HotkeyTarget::Overlay => reg_ov_hk = next,
@@ -5060,7 +5454,7 @@ fn controller_loop(
                             }
                         };
                         let mut s = state.lock().unwrap();
-                        s.hotkey_revert = Some((target, prev));
+                        s.hotkey_revert.push((target, prev));
                         s.error = Some(e.to_string());
                     }
                 }
@@ -5071,12 +5465,10 @@ fn controller_loop(
                     let _ = tx.send(CtrlCmd::ToggleCapture);
                 }
                 HotkeyEvent::ToggleOverlay => {
-                    state.lock().unwrap().toggle_overlay_requested = true;
-                    ctx.request_repaint();
+                    let _ = tx.send(CtrlCmd::ToggleOverlay);
                 }
                 HotkeyEvent::ToggleClickThrough => {
-                    state.lock().unwrap().toggle_click_through_requested = true;
-                    ctx.request_repaint();
+                    let _ = tx.send(CtrlCmd::ToggleClickThrough);
                 }
             },
             CtrlCmd::ShowWindow => {
@@ -5085,6 +5477,7 @@ fn controller_loop(
                 }
             }
             CtrlCmd::Quit => {
+                shutdown_cancel.store(true, Ordering::Relaxed);
                 {
                     let mut s = state.lock().unwrap();
                     s.force_quit = true;
@@ -5092,7 +5485,12 @@ fn controller_loop(
                         dl.cancel.store(true, Ordering::Relaxed);
                     }
                 }
-                stop_pipeline(&mut active_audio, &mut active_asr, &mut active_coord);
+                stop_pipeline(
+                    &mut active_audio,
+                    &mut active_asr,
+                    &mut active_coord,
+                    &mut active_session_id,
+                );
                 if let Some(sh) = shell.as_ref() {
                     sh.set_progress(TaskbarProgress::None);
                     sh.request_close_window();
@@ -5100,6 +5498,7 @@ fn controller_loop(
                 break;
             }
             CtrlCmd::ShutdownController => {
+                shutdown_cancel.store(true, Ordering::Relaxed);
                 {
                     let mut s = state.lock().unwrap();
                     s.force_quit = true;
@@ -5107,12 +5506,23 @@ fn controller_loop(
                         dl.cancel.store(true, Ordering::Relaxed);
                     }
                 }
-                stop_pipeline(&mut active_audio, &mut active_asr, &mut active_coord);
+                stop_pipeline(
+                    &mut active_audio,
+                    &mut active_asr,
+                    &mut active_coord,
+                    &mut active_session_id,
+                );
                 break;
             }
         }
     }
 
+    if let Some(j) = dl_join.take() {
+        let _ = j.join();
+    }
+    if let Some(j) = bench_join.take() {
+        let _ = j.join();
+    }
     hotkey.shutdown();
     if let Some(llm_mut) = Arc::get_mut(&mut llm) {
         llm_mut.shutdown();

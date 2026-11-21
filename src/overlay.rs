@@ -2,10 +2,12 @@ use anyhow::{anyhow, Result};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem::{size_of, ManuallyDrop};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::null_mut;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 use windows::core::{w, IUnknown, Interface, PCWSTR};
@@ -16,9 +18,9 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Factory, ID2D1Geometry, ID2D1RenderTarget, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
-    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_DRAW_TEXT_OPTIONS_NONE,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1Geometry, ID2D1RenderTarget,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+    D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_DRAW_TEXT_OPTIONS_NONE,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS,
     D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_ROUNDED_RECT,
     D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
@@ -32,10 +34,11 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, AC_SRC_ALPHA,
-    AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
+    AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP,
+    HDC, HGDIOBJ,
 };
 use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmap, IWICImagingFactory,
     WICBitmapCacheOnDemand, WICBitmapLockRead, WICRect,
 };
 use windows::Win32::System::Com::{
@@ -50,13 +53,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, GetClientRect,
     GetMessageW, GetWindowLongPtrW, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow,
-    GWLP_USERDATA, GWL_EXSTYLE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT,
-    HTTOP, HTTOPLEFT, HTTOPRIGHT, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, MSG,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOWNOACTIVATE, ULW_ALPHA, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_EXITSIZEMOVE,
-    WM_MOUSEMOVE, WM_MOVE, WM_NCHITTEST, WM_NCDESTROY, WM_SIZE, WM_TIMER, WNDCLASSEXW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UnregisterClassW,
+    UpdateLayeredWindow, GWLP_USERDATA, GWL_EXSTYLE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
+    HTCAPTION, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HTTRANSPARENT, HWND_NOTOPMOST,
+    HWND_TOPMOST, IDC_ARROW, MINMAXINFO, MSG, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_APP, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_MOUSEMOVE, WM_MOVE, WM_NCHITTEST,
+    WM_NCDESTROY, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 const WM_NCMOUSEMOVE: u32 = 0x00A0;
@@ -137,9 +141,9 @@ enum OverlayCmd {
 }
 
 pub struct OverlayHandle {
-    hwnd_raw: isize,
-    cmd_queue: Arc<std::sync::Mutex<Vec<OverlayCmd>>>,
-    join: Option<JoinHandle<()>>,
+    hwnd_raw: AtomicIsize,
+    cmd_queue: Arc<Mutex<Vec<OverlayCmd>>>,
+    join: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl OverlayHandle {
@@ -148,7 +152,7 @@ impl OverlayHandle {
         saved_window: Option<WindowState>,
         on_event: Arc<dyn Fn(OverlayEvent) + Send + Sync>,
     ) -> Result<Self> {
-        let cmd_queue = Arc::new(std::sync::Mutex::new(Vec::<OverlayCmd>::new()));
+        let cmd_queue = Arc::new(Mutex::new(Vec::<OverlayCmd>::new()));
         let queue_c = Arc::clone(&cmd_queue);
         let (hwnd_tx, hwnd_rx) = mpsc::channel::<Result<isize>>();
 
@@ -164,16 +168,20 @@ impl OverlayHandle {
             .map_err(|_| anyhow!("Overlay thread exited during startup"))??;
 
         Ok(Self {
-            hwnd_raw,
+            hwnd_raw: AtomicIsize::new(hwnd_raw),
             cmd_queue,
-            join: Some(join),
+            join: Mutex::new(Some(join)),
         })
     }
 
     fn post(&self, msg_id: u32, cmd: OverlayCmd) {
-        self.cmd_queue.lock().unwrap().push(cmd);
-        if self.hwnd_raw != 0 {
-            let hwnd = HWND(self.hwnd_raw as *mut _);
+        self.cmd_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(cmd);
+        let raw = self.hwnd_raw.load(Ordering::Acquire);
+        if raw != 0 {
+            let hwnd = HWND(raw as *mut _);
             unsafe {
                 let _ = PostMessageW(hwnd, msg_id, WPARAM(0), LPARAM(0));
             }
@@ -193,14 +201,22 @@ impl OverlayHandle {
     }
 
     pub fn current_window_state(&self) -> Option<WindowState> {
-        query_window_state(self.hwnd_raw)
+        query_window_state(self.hwnd_raw.load(Ordering::Acquire))
     }
 
-    pub fn shutdown(&mut self) {
-        if self.hwnd_raw != 0 {
-            self.post(WM_APP_QUIT, OverlayCmd::Shutdown);
+    pub fn shutdown(&self) {
+        let raw = self.hwnd_raw.swap(0, Ordering::SeqCst);
+        if raw != 0 {
+            self.cmd_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(OverlayCmd::Shutdown);
+            let hwnd = HWND(raw as *mut _);
+            unsafe {
+                let _ = PostMessageW(hwnd, WM_APP_QUIT, WPARAM(0), LPARAM(0));
+            }
         }
-        if let Some(j) = self.join.take() {
+        if let Some(j) = self.join.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = j.join();
         }
     }
@@ -212,11 +228,56 @@ impl Drop for OverlayHandle {
     }
 }
 
+struct ComInitGuard(bool);
+
+impl Drop for ComInitGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+    }
+}
+
 struct CachedBgImage {
     path: String,
     width: u32,
     height: u32,
     pbgra: Vec<u8>,
+}
+
+enum CachedBgState {
+    Loaded(CachedBgImage),
+    Failed(String),
+}
+
+struct SurfaceCache {
+    width: u32,
+    height: u32,
+    wic_bmp: IWICBitmap,
+    rt: ID2D1RenderTarget,
+    hbm: HBITMAP,
+    bits_ptr: *mut u8,
+    mem_dc: HDC,
+    old_obj: HGDIOBJ,
+    cached_bg_bmp: Option<(String, ID2D1Bitmap)>,
+}
+
+impl Drop for SurfaceCache {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.mem_dc.is_invalid() {
+                if !self.old_obj.is_invalid() {
+                    let _ = SelectObject(self.mem_dc, self.old_obj);
+                }
+                let _ = DeleteDC(self.mem_dc);
+            }
+            if !self.hbm.is_invalid() {
+                let _ = DeleteObject(self.hbm);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -270,8 +331,9 @@ struct OverlayInner {
     d2d_factory: ID2D1Factory,
     dw_factory: IDWriteFactory,
     wic_factory: IWICImagingFactory,
-    cached_bg: Option<CachedBgImage>,
-    cmd_queue: Arc<std::sync::Mutex<Vec<OverlayCmd>>>,
+    cached_bg: Option<CachedBgState>,
+    surface: Option<SurfaceCache>,
+    cmd_queue: Arc<Mutex<Vec<OverlayCmd>>>,
     on_event: Arc<dyn Fn(OverlayEvent) + Send + Sync>,
 }
 
@@ -624,17 +686,165 @@ unsafe fn draw_block(
     }
 }
 
+unsafe fn apply_window_styles_win32(
+    hwnd: HWND,
+    click_through: bool,
+    top_most: bool,
+    should_show: bool,
+) {
+    let mut ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+    ex |= (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE).0;
+    if click_through {
+        ex |= WS_EX_TRANSPARENT.0;
+    } else {
+        ex &= !WS_EX_TRANSPARENT.0;
+    }
+    if top_most {
+        ex |= WS_EX_TOPMOST.0;
+    } else {
+        ex &= !WS_EX_TOPMOST.0;
+    }
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex as isize);
+
+    let z_order = if top_most { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    let _ = SetWindowPos(
+        hwnd,
+        z_order,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    );
+
+    let _ = ShowWindow(
+        hwnd,
+        if should_show { SW_SHOWNOACTIVATE } else { SW_HIDE },
+    );
+}
+
+unsafe fn sync_autohide_timer_win32(hwnd: HWND, active: bool) {
+    if active {
+        let _ = SetTimer(hwnd, TIMER_AUTOHIDE_ID, 33, None);
+    } else {
+        let _ = KillTimer(hwnd, TIMER_AUTOHIDE_ID);
+    }
+}
+
+unsafe fn sync_anim_timer_win32(hwnd: HWND, state_rc: &Rc<RefCell<OverlayInner>>) {
+    let action = {
+        let mut st = state_rc.borrow_mut();
+        let want = st.scroll_anim.is_some() && st.cfg.visible && !st.hidden_by_autohide;
+        if want && !st.anim_timer_active {
+            st.anim_timer_active = true;
+            Some(true)
+        } else if !want && st.anim_timer_active {
+            st.anim_timer_active = false;
+            Some(false)
+        } else {
+            None
+        }
+    };
+    match action {
+        Some(true) => {
+            let _ = SetTimer(hwnd, TIMER_ANIM_ID, 16, None);
+        }
+        Some(false) => {
+            let _ = KillTimer(hwnd, TIMER_ANIM_ID);
+        }
+        None => {}
+    }
+}
+
+unsafe fn build_surface_cache(
+    wic_factory: &IWICImagingFactory,
+    d2d_factory: &ID2D1Factory,
+    w: u32,
+    h: u32,
+) -> Option<SurfaceCache> {
+    let wic_bmp = wic_factory
+        .CreateBitmap(
+            w,
+            h,
+            &GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapCacheOnDemand,
+        )
+        .ok()?;
+
+    let rt_props = D2D1_RENDER_TARGET_PROPERTIES {
+        r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        ..Default::default()
+    };
+
+    let rt: ID2D1RenderTarget = d2d_factory
+        .CreateWicBitmapRenderTarget(&wic_bmp, &rt_props)
+        .ok()?;
+
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = w as i32;
+    bmi.bmiHeader.biHeight = -(h as i32);
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB.0;
+
+    let mut bits_ptr: *mut core::ffi::c_void = null_mut();
+    let Ok(hbm) = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0) else {
+        return None;
+    };
+    if hbm.is_invalid() || bits_ptr.is_null() {
+        if !hbm.is_invalid() {
+            let _ = DeleteObject(hbm);
+        }
+        return None;
+    }
+
+    let mem_dc = CreateCompatibleDC(None);
+    if mem_dc.is_invalid() {
+        let _ = DeleteObject(hbm);
+        return None;
+    }
+    let old_obj = SelectObject(mem_dc, hbm);
+
+    Some(SurfaceCache {
+        width: w,
+        height: h,
+        wic_bmp,
+        rt,
+        hbm,
+        bits_ptr: bits_ptr as *mut u8,
+        mem_dc,
+        old_obj,
+        cached_bg_bmp: None,
+    })
+}
+
 impl OverlayInner {
-    fn load_bg_image_cached(&mut self, path: &str) -> Option<&CachedBgImage> {
-        let same = self
-            .cached_bg
-            .as_ref()
-            .is_some_and(|c| c.path == path);
-        if !same {
+    fn refresh_bg_image_cache(&mut self) {
+        let Some(path) = self.cfg.bg_image_path.as_deref() else {
+            self.cached_bg = None;
+            return;
+        };
+        let same = match self.cached_bg.as_ref() {
+            Some(CachedBgState::Loaded(c)) => c.path == path,
+            Some(CachedBgState::Failed(p)) => p == path,
+            None => false,
+        };
+        if same {
+            return;
+        }
+        let loaded = (|| -> Option<CachedBgImage> {
             let decoded = image::open(path).ok()?.to_rgba8();
             let w = decoded.width();
             let h = decoded.height();
-            let mut pbgra = vec![0u8; (w * h * 4) as usize];
+            let byte_len = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+            let mut pbgra = vec![0u8; byte_len];
             for (src, dst) in decoded.as_raw().chunks_exact(4).zip(pbgra.chunks_exact_mut(4)) {
                 let a = (src[3] as f32) / 255.0;
                 dst[0] = ((src[2] as f32) * a).round() as u8;
@@ -642,93 +852,33 @@ impl OverlayInner {
                 dst[2] = ((src[0] as f32) * a).round() as u8;
                 dst[3] = src[3];
             }
-            self.cached_bg = Some(CachedBgImage {
+            Some(CachedBgImage {
                 path: path.to_string(),
                 width: w,
                 height: h,
                 pbgra,
-            });
-        }
-        self.cached_bg.as_ref()
+            })
+        })();
+        self.cached_bg = Some(match loaded {
+            Some(img) => CachedBgState::Loaded(img),
+            None => CachedBgState::Failed(path.to_string()),
+        });
     }
 
-    fn apply_window_styles(&self) {
-        unsafe {
-            let mut ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32;
-            ex |= (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE).0;
-            if self.cfg.click_through {
-                ex |= WS_EX_TRANSPARENT.0;
-            } else {
-                ex &= !WS_EX_TRANSPARENT.0;
-            }
-            if self.cfg.top_most {
-                ex |= WS_EX_TOPMOST.0;
-            } else {
-                ex &= !WS_EX_TOPMOST.0;
-            }
-            SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, ex as isize);
-
-            let z_order = if self.cfg.top_most {
-                HWND_TOPMOST
-            } else {
-                HWND_NOTOPMOST
-            };
-            let _ = SetWindowPos(
-                self.hwnd,
-                z_order,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-            );
-
-            let should_show = self.cfg.visible && !self.hidden_by_autohide;
-            let _ = ShowWindow(
-                self.hwnd,
-                if should_show { SW_SHOWNOACTIVATE } else { SW_HIDE },
-            );
-        }
+    fn wants_autohide_timer(&self) -> bool {
+        self.cfg.visible && self.cfg.auto_hide_sec > 0.05 && !self.hidden_by_autohide
     }
 
-    fn reset_autohide(&mut self) {
+    fn reset_autohide_state(&mut self) -> bool {
         self.last_activity = Instant::now();
         self.fade_alpha = 255;
         self.fading_started_at = None;
         let was_hidden = self.hidden_by_autohide;
         self.hidden_by_autohide = false;
-        if was_hidden && self.cfg.visible {
-            unsafe {
-                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
-            }
-        }
-        self.sync_timer();
+        was_hidden && self.cfg.visible
     }
 
-    fn sync_timer(&self) {
-        unsafe {
-            if self.cfg.visible && self.cfg.auto_hide_sec > 0.05 && !self.hidden_by_autohide {
-                let _ = SetTimer(self.hwnd, TIMER_AUTOHIDE_ID, 33, None);
-            } else {
-                let _ = KillTimer(self.hwnd, TIMER_AUTOHIDE_ID);
-            }
-        }
-    }
-
-    fn sync_anim_timer(&mut self) {
-        let want = self.scroll_anim.is_some() && self.cfg.visible && !self.hidden_by_autohide;
-        unsafe {
-            if want && !self.anim_timer_active {
-                let _ = SetTimer(self.hwnd, TIMER_ANIM_ID, 16, None);
-                self.anim_timer_active = true;
-            } else if !want && self.anim_timer_active {
-                let _ = KillTimer(self.hwnd, TIMER_ANIM_ID);
-                self.anim_timer_active = false;
-            }
-        }
-    }
-
-    fn apply_payload(&mut self, new_payload: OverlayPayload) {
+    fn prepare_payload_update(&mut self, new_payload: OverlayPayload) -> (HWND, bool, bool) {
         let same_ids = self.payload.items.len() == new_payload.items.len()
             && self
                 .payload
@@ -778,162 +928,105 @@ impl OverlayInner {
         }
 
         self.payload = new_payload;
-        self.reset_autohide();
-        self.sync_anim_timer();
-        self.render();
+        let show_now = self.reset_autohide_state();
+        let want_timer = self.wants_autohide_timer();
+        (self.hwnd, show_now, want_timer)
     }
+}
 
-    fn tick_autohide(&mut self) {
-        if self.cfg.auto_hide_sec <= 0.05 || !self.cfg.visible {
-            return;
-        }
-        if self.hovered && !self.cfg.click_through {
-            self.last_activity = Instant::now();
-            if self.fade_alpha < 255 {
-                self.fade_alpha = 255;
-                self.fading_started_at = None;
-                self.render();
-            }
-            return;
-        }
-
-        let elapsed = self.last_activity.elapsed().as_secs_f32();
-        if elapsed < self.cfg.auto_hide_sec {
-            return;
-        }
-
-        match self.cfg.hide_animation {
-            HideAnimation::None => {
-                self.hidden_by_autohide = true;
-                self.fade_alpha = 0;
-                unsafe {
-                    let _ = ShowWindow(self.hwnd, SW_HIDE);
-                }
-                self.sync_timer();
-                self.sync_anim_timer();
-            }
-            HideAnimation::Fade => {
-                let fade_start = *self.fading_started_at.get_or_insert_with(Instant::now);
-                let dur = (self.cfg.hide_duration_ms.max(50) as f32) / 1000.0;
-                let t = (fade_start.elapsed().as_secs_f32() / dur).clamp(0.0, 1.0);
-                let next_alpha = ((1.0 - t) * 255.0).round() as u8;
-                if next_alpha != self.fade_alpha {
-                    self.fade_alpha = next_alpha;
-                    self.render();
-                }
-                if t >= 1.0 {
-                    self.hidden_by_autohide = true;
-                    unsafe {
-                        let _ = ShowWindow(self.hwnd, SW_HIDE);
-                    }
-                    self.sync_timer();
-                    self.sync_anim_timer();
-                }
-            }
-        }
-    }
-
-    fn render(&mut self) {
-        if !self.cfg.visible || self.hidden_by_autohide {
+unsafe fn render_overlay(state_rc: &Rc<RefCell<OverlayInner>>) {
+    let (hwnd, w, h, mut surface) = {
+        let mut st = state_rc.borrow_mut();
+        if !st.cfg.visible || st.hidden_by_autohide {
             return;
         }
         let mut client = RECT::default();
-        unsafe {
-            if GetClientRect(self.hwnd, &mut client).is_err() {
-                return;
-            }
+        if GetClientRect(st.hwnd, &mut client).is_err() {
+            return;
         }
-        let w = (client.right - client.left).max(1) as u32;
-        let h = (client.bottom - client.top).max(1) as u32;
+        let raw_w = client.right - client.left;
+        let raw_h = client.bottom - client.top;
+        if raw_w <= 0 || raw_h <= 0 {
+            return;
+        }
+        let w = raw_w as u32;
+        let h = raw_h as u32;
 
-        let dpi_scale = unsafe {
-            let dpi = GetDpiForWindow(self.hwnd);
-            if dpi == 0 {
-                1.0
-            } else {
-                (dpi as f32) / 96.0
-            }
-        };
-
-        let Ok(wic_bmp) = (unsafe {
-            self.wic_factory.CreateBitmap(
-                w,
-                h,
-                &GUID_WICPixelFormat32bppPBGRA,
-                WICBitmapCacheOnDemand,
-            )
-        }) else {
+        if st.surface.as_ref().is_some_and(|s| s.width != w || s.height != h) {
+            st.surface = None;
+        }
+        let mut surf = st.surface.take();
+        if surf.is_none() {
+            surf = build_surface_cache(&st.wic_factory, &st.d2d_factory, w, h);
+        }
+        let Some(s) = surf else {
             return;
         };
+        st.refresh_bg_image_cache();
+        (st.hwnd, w, h, s)
+    };
 
-        let rt_props = D2D1_RENDER_TARGET_PROPERTIES {
-            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            dpiX: 96.0,
-            dpiY: 96.0,
-            ..Default::default()
-        };
+    let dpi_scale = {
+        let dpi = GetDpiForWindow(hwnd);
+        if dpi == 0 {
+            1.0
+        } else {
+            (dpi as f32) / 96.0
+        }
+    };
 
-        let Ok(rt): Result<ID2D1RenderTarget, _> =
-            (unsafe { self.d2d_factory.CreateWicBitmapRenderTarget(&wic_bmp, &rt_props) })
-        else {
-            return;
-        };
-
-        let bg_img_data = self
-            .cfg
-            .bg_image_path
-            .clone()
-            .and_then(|p| self.load_bg_image_cached(&p).map(|c| (c.width, c.height, c.pbgra.clone())));
-
-        let no_speech_yet = self.payload.items.is_empty();
+    let (anim_finished, fade_alpha) = {
+        let mut st = state_rc.borrow_mut();
+        let no_speech_yet = st.payload.items.is_empty();
         let mut next_snapshots = Vec::new();
         let mut anim_finished = false;
 
-        unsafe {
-            rt.BeginDraw();
-            rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-            rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-            let clear = D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.0,
-            };
-            rt.Clear(Some(&clear));
+        let rt = &surface.rt;
+        rt.BeginDraw();
+        rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        let clear = D2D1_COLOR_F {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        };
+        rt.Clear(Some(&clear));
 
-            let wf = w as f32;
-            let hf = h as f32;
-            let radius = (self.cfg.border_radius * dpi_scale).min(wf * 0.45).min(hf * 0.45);
-            let rr = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F {
-                    left: 0.5,
-                    top: 0.5,
-                    right: wf - 0.5,
-                    bottom: hf - 0.5,
-                },
-                radiusX: radius,
-                radiusY: radius,
-            };
+        let wf = w as f32;
+        let hf = h as f32;
+        let radius = (st.cfg.border_radius * dpi_scale).min(wf * 0.45).min(hf * 0.45);
+        let rr = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: 0.5,
+                top: 0.5,
+                right: wf - 0.5,
+                bottom: hf - 0.5,
+            },
+            radiusX: radius,
+            radiusY: radius,
+        };
 
-            let mut bg_alpha = (self.cfg.bg_opacity_pct / 100.0).clamp(0.0, 1.0);
-            // Keep alpha >= 1/255 inside overlay rect when interactive so dragging works at 0% opacity
-            if !self.cfg.click_through && bg_alpha < (1.0 / 255.0) {
-                bg_alpha = 1.0 / 255.0;
+        let mut bg_alpha = (st.cfg.bg_opacity_pct / 100.0).clamp(0.0, 1.0);
+        // Keep alpha >= 1/255 inside overlay rect when interactive so dragging works at 0% opacity
+        if !st.cfg.click_through && bg_alpha < (1.0 / 255.0) {
+            bg_alpha = 1.0 / 255.0;
+        }
+
+        if bg_alpha > 0.0 {
+            let bg_col = d2d_color_from_hex(&st.cfg.bg_color_hex, bg_alpha);
+            if let Ok(bg_brush) = rt.CreateSolidColorBrush(&bg_col, None) {
+                rt.FillRoundedRectangle(&rr, &bg_brush);
             }
+        }
 
-            if bg_alpha > 0.0 {
-                let bg_col = d2d_color_from_hex(&self.cfg.bg_color_hex, bg_alpha);
-                if let Ok(bg_brush) = rt.CreateSolidColorBrush(&bg_col, None) {
-                    rt.FillRoundedRectangle(&rr, &bg_brush);
-                }
-            }
-
-            // Optional background image clipped to rounded rectangle
-            if let Some((iw, ih, pbgra)) = bg_img_data {
+        // Optional background image clipped to rounded rectangle
+        if let Some(CachedBgState::Loaded(ref img)) = st.cached_bg {
+            let need_upload = surface
+                .cached_bg_bmp
+                .as_ref()
+                .is_none_or(|(p, _)| p != &img.path);
+            if need_upload {
                 let bmp_props = D2D1_BITMAP_PROPERTIES {
                     pixelFormat: D2D1_PIXEL_FORMAT {
                         format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -942,267 +1035,259 @@ impl OverlayInner {
                     dpiX: 96.0,
                     dpiY: 96.0,
                 };
-                if let Ok(d2d_bmp) = rt.CreateBitmap(
+                if let Ok(bmp) = rt.CreateBitmap(
                     D2D_SIZE_U {
-                        width: iw,
-                        height: ih,
+                        width: img.width,
+                        height: img.height,
                     },
-                    Some(pbgra.as_ptr() as *const _),
-                    iw * 4,
+                    Some(img.pbgra.as_ptr() as *const _),
+                    img.width * 4,
                     &bmp_props,
                 ) {
-                    if let (Ok(geom), Ok(layer)) = (
-                        self.d2d_factory.CreateRoundedRectangleGeometry(&rr),
-                        rt.CreateLayer(None),
+                    surface.cached_bg_bmp = Some((img.path.clone(), bmp));
+                } else {
+                    surface.cached_bg_bmp = None;
+                }
+            }
+
+            if let Some((_, ref d2d_bmp)) = surface.cached_bg_bmp {
+                if let (Ok(geom), Ok(layer)) = (
+                    st.d2d_factory.CreateRoundedRectangleGeometry(&rr),
+                    rt.CreateLayer(None),
+                ) {
+                    let mask_geom: ID2D1Geometry = geom.into();
+                    let params = D2D1_LAYER_PARAMETERS {
+                        contentBounds: rr.rect,
+                        geometricMask: ManuallyDrop::new(Some(mask_geom)),
+                        maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                        maskTransform: IDENTITY_MATRIX,
+                        opacity: 1.0,
+                        opacityBrush: ManuallyDrop::new(None),
+                        layerOptions: D2D1_LAYER_OPTIONS_NONE,
+                    };
+                    rt.PushLayer(&params, &layer);
+                    let img_alpha = (st.cfg.bg_opacity_pct / 100.0).clamp(0.1, 1.0);
+                    rt.DrawBitmap(
+                        d2d_bmp,
+                        Some(&rr.rect),
+                        img_alpha,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        None,
+                    );
+                    rt.PopLayer();
+                    let _ = ManuallyDrop::into_inner(params.geometricMask);
+                }
+            }
+        } else {
+            surface.cached_bg_bmp = None;
+        }
+
+        // Render subtitle blocks with smooth upward scroll crawl
+        let pad_x = 18.0 * dpi_scale;
+        let pad_y = 12.0 * dpi_scale;
+        let max_w = (wf - pad_x * 2.0).max(40.0);
+        let max_block_h = (hf - pad_y * 2.0).max(40.0);
+
+        // Subtle interactive border frame while not click-through
+        if !st.cfg.click_through && (st.hovered || no_speech_yet) {
+            let border_alpha = if st.hovered { 0.45 } else { 0.22 };
+            let border_col = D2D1_COLOR_F {
+                r: 0.45,
+                g: 0.45,
+                b: 0.45,
+                a: border_alpha,
+            };
+            if let Ok(border_brush) = rt.CreateSolidColorBrush(&border_col, None) {
+                rt.DrawRoundedRectangle(&rr, &border_brush, 1.2, None);
+            }
+        }
+
+        if no_speech_yet {
+            if !st.cfg.click_through {
+                if let Some(first_vis) = st.cfg.lines.iter().find(|l| l.visible) {
+                    if let Some(hint_sl) = build_sub_line(
+                        &st.dw_factory,
+                        "Translate Live — Drag to move · Edges to resize",
+                        &first_vis.font_family,
+                        first_vis.font_size,
+                        DWRITE_FONT_WEIGHT_NORMAL,
+                        first_vis.align,
+                        &first_vis.color_hex,
+                        0.65,
+                        None,
+                        usize::MAX,
+                        first_vis.outline,
+                        0.75,
+                        max_w,
+                        max_block_h,
+                        dpi_scale,
+                        0.0,
                     ) {
-                        let mask_geom: ID2D1Geometry = geom.into();
-                        let params = D2D1_LAYER_PARAMETERS {
-                            contentBounds: rr.rect,
-                            geometricMask: ManuallyDrop::new(Some(mask_geom)),
-                            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                            maskTransform: Matrix3x2 {
-                                M11: 1.0,
-                                M12: 0.0,
-                                M21: 0.0,
-                                M22: 1.0,
-                                M31: 0.0,
-                                M32: 0.0,
-                            },
-                            opacity: 1.0,
-                            opacityBrush: ManuallyDrop::new(None),
-                            layerOptions: D2D1_LAYER_OPTIONS_NONE,
+                        let bh = hint_sl.height;
+                        let hint_block = PreparedBlock {
+                            sub_lines: vec![hint_sl],
+                            raw_height: bh,
+                            align: first_vis.align,
                         };
-                        rt.PushLayer(&params, &layer);
-                        let img_alpha = (self.cfg.bg_opacity_pct / 100.0).clamp(0.1, 1.0);
-                        rt.DrawBitmap(
-                            &d2d_bmp,
-                            Some(&rr.rect),
-                            img_alpha,
-                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                            None,
-                        );
-                        rt.PopLayer();
-                        let _ = ManuallyDrop::into_inner(params.geometricMask);
+                        let y = ((hf - bh) * 0.5).max(pad_y);
+                        draw_block(rt, &hint_block, y, 1.0, 1.0, wf, pad_x);
                     }
                 }
             }
+        } else {
+            let count = st.payload.items.len();
+            let item_gap = 8.0 * dpi_scale;
+            let mut active_blocks: Vec<(&OverlayLineItem, usize, PreparedBlock, f32, f32)> =
+                Vec::with_capacity(count);
+            let mut total_text_h = 0.0f32;
 
-            // Render subtitle blocks with smooth upward scroll crawl
-            let pad_x = 18.0 * dpi_scale;
-            let pad_y = 12.0 * dpi_scale;
-            let max_w = (wf - pad_x * 2.0).max(40.0);
-            let max_block_h = (hf - pad_y * 2.0).max(40.0);
-
-            // Subtle interactive border frame while not click-through
-            if !self.cfg.click_through && (self.hovered || no_speech_yet) {
-                let border_alpha = if self.hovered { 0.45 } else { 0.22 };
-                let border_col = D2D1_COLOR_F {
-                    r: 0.45,
-                    g: 0.45,
-                    b: 0.45,
-                    a: border_alpha,
-                };
-                if let Ok(border_brush) = rt.CreateSolidColorBrush(&border_col, None) {
-                    rt.DrawRoundedRectangle(&rr, &border_brush, 1.2, None);
+            for (idx, item) in st.payload.items.iter().enumerate() {
+                let age = count - 1 - idx;
+                if let Some(block) = build_block(
+                    &st.dw_factory,
+                    &st.cfg.lines,
+                    item,
+                    age,
+                    max_w,
+                    max_block_h,
+                    dpi_scale,
+                ) {
+                    let (target_scale, target_alpha) = age_style(age);
+                    let scaled_h = block.raw_height * target_scale;
+                    if !active_blocks.is_empty() {
+                        total_text_h += item_gap;
+                    }
+                    total_text_h += scaled_h;
+                    active_blocks.push((item, age, block, target_scale, target_alpha));
                 }
             }
 
-            if no_speech_yet {
-                if !self.cfg.click_through {
-                    if let Some(first_vis) = self.cfg.lines.iter().find(|l| l.visible) {
-                        if let Some(hint_sl) = build_sub_line(
-                            &self.dw_factory,
-                            "Translate Live — Drag to move · Edges to resize",
-                            &first_vis.font_family,
-                            first_vis.font_size,
-                            DWRITE_FONT_WEIGHT_NORMAL,
-                            first_vis.align,
-                            &first_vis.color_hex,
-                            0.65,
-                            None,
-                            usize::MAX,
-                            first_vis.outline,
-                            0.75,
-                            max_w,
-                            max_block_h,
-                            dpi_scale,
-                            0.0,
-                        ) {
-                            let h = hint_sl.height;
-                            let hint_block = PreparedBlock {
-                                sub_lines: vec![hint_sl],
-                                raw_height: h,
-                                align: first_vis.align,
-                            };
-                            let y = ((hf - h) * 0.5).max(pad_y);
-                            draw_block(&rt, &hint_block, y, 1.0, 1.0, wf, pad_x);
-                        }
-                    }
-                }
+            let avail_h = (hf - pad_y * 2.0).max(20.0);
+            let stack_top = if total_text_h <= avail_h {
+                pad_y + (avail_h - total_text_h) * 0.5
             } else {
-                let count = self.payload.items.len();
-                let item_gap = 8.0 * dpi_scale;
-                let mut active_blocks: Vec<(&OverlayLineItem, usize, PreparedBlock, f32, f32)> =
-                    Vec::with_capacity(count);
-                let mut total_text_h = 0.0f32;
+                hf - pad_y - total_text_h
+            };
 
-                for (idx, item) in self.payload.items.iter().enumerate() {
-                    let age = count - 1 - idx;
+            let mut target_ys = Vec::with_capacity(active_blocks.len());
+            let mut cur_y = stack_top;
+            for (_, _, block, target_scale, _) in &active_blocks {
+                target_ys.push(cur_y);
+                cur_y += block.raw_height * *target_scale + item_gap;
+            }
+
+            let anim_progress = st.scroll_anim.as_ref().map(|anim| {
+                compute_scroll_easing(anim.started_at.elapsed().as_secs_f32(), anim.duration_sec)
+            });
+            anim_finished = anim_progress.is_some_and(|(t, _)| t >= 1.0);
+
+            let clip_rect = D2D_RECT_F {
+                left: (pad_x * 0.4).max(4.0),
+                top: (pad_y * 0.4).max(4.0),
+                right: (wf - pad_x * 0.4).max(8.0),
+                bottom: (hf - pad_y * 0.4).max(8.0),
+            };
+            rt.PushAxisAlignedClip(&clip_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+            if let (Some(anim), Some((anim_t, ease))) = (&st.scroll_anim, anim_progress) {
+                let exit_fade = 1.0 - anim_t.powf(0.85);
+                for ex in &anim.exiting {
                     if let Some(block) = build_block(
-                        &self.dw_factory,
-                        &self.cfg.lines,
-                        item,
-                        age,
+                        &st.dw_factory,
+                        &st.cfg.lines,
+                        &ex.item,
+                        ex.age_at_exit,
                         max_w,
                         max_block_h,
                         dpi_scale,
                     ) {
-                        let (target_scale, target_alpha) = age_style(age);
-                        let scaled_h = block.raw_height * target_scale;
-                        if !active_blocks.is_empty() {
-                            total_text_h += item_gap;
-                        }
-                        total_text_h += scaled_h;
-                        active_blocks.push((item, age, block, target_scale, target_alpha));
+                        let draw_y = lerp(ex.start_y, ex.end_y, ease);
+                        let draw_scale = lerp(ex.start_scale, ex.end_scale, ease);
+                        let draw_alpha = lerp(ex.start_alpha_mul, 0.0, 1.0 - exit_fade);
+                        draw_block(rt, &block, draw_y, draw_scale, draw_alpha, wf, pad_x);
                     }
                 }
+            }
 
-                let avail_h = (hf - pad_y * 2.0).max(20.0);
-                let stack_top = if total_text_h <= avail_h {
-                    pad_y + (avail_h - total_text_h) * 0.5
-                } else {
-                    hf - pad_y - total_text_h
-                };
-
-                let mut target_ys = Vec::with_capacity(active_blocks.len());
-                let mut cur_y = stack_top;
-                for (_, _, block, target_scale, _) in &active_blocks {
-                    target_ys.push(cur_y);
-                    cur_y += block.raw_height * *target_scale + item_gap;
-                }
-
-                let anim_progress = self.scroll_anim.as_ref().map(|anim| {
-                    compute_scroll_easing(anim.started_at.elapsed().as_secs_f32(), anim.duration_sec)
-                });
-                anim_finished = anim_progress.is_some_and(|(t, _)| t >= 1.0);
-
-                let clip_rect = D2D_RECT_F {
-                    left: (pad_x * 0.4).max(4.0),
-                    top: (pad_y * 0.4).max(4.0),
-                    right: (wf - pad_x * 0.4).max(8.0),
-                    bottom: (hf - pad_y * 0.4).max(8.0),
-                };
-                rt.PushAxisAlignedClip(&clip_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-
-                // Draw outgoing top items smoothly gliding out past the top clip edge
-                if let (Some(anim), Some((anim_t, ease))) = (&self.scroll_anim, anim_progress) {
-                    let exit_fade = 1.0 - anim_t.powf(0.85);
-                    for ex in &anim.exiting {
-                        if let Some(block) = build_block(
-                            &self.dw_factory,
-                            &self.cfg.lines,
-                            &ex.item,
-                            ex.age_at_exit,
-                            max_w,
-                            max_block_h,
-                            dpi_scale,
-                        ) {
-                            let draw_y = lerp(ex.start_y, ex.end_y, ease);
-                            let draw_scale = lerp(ex.start_scale, ex.end_scale, ease);
-                            let draw_alpha = lerp(ex.start_alpha_mul, 0.0, 1.0 - exit_fade);
-                            draw_block(&rt, &block, draw_y, draw_scale, draw_alpha, wf, pad_x);
-                        }
-                    }
-                }
-
-                // Draw active items (older receding gently at top, newest live at bottom)
-                for (i, (item, age, block, target_scale, target_alpha)) in
-                    active_blocks.into_iter().enumerate()
+            for (i, (item, age, block, target_scale, target_alpha)) in
+                active_blocks.into_iter().enumerate()
+            {
+                let target_y = target_ys[i];
+                let scaled_h = block.raw_height * target_scale;
+                let (draw_y, draw_scale, draw_alpha) = if let (Some(anim), Some((_, ease))) =
+                    (&st.scroll_anim, anim_progress)
                 {
-                    let target_y = target_ys[i];
-                    let scaled_h = block.raw_height * target_scale;
-                    let (draw_y, draw_scale, draw_alpha) = if let (Some(anim), Some((_, ease))) =
-                        (&self.scroll_anim, anim_progress)
-                    {
-                        if let Some(tr) = anim.tracks.get(&item.id) {
-                            (
-                                lerp(tr.start_y, target_y, ease),
-                                lerp(tr.start_scale, target_scale, ease),
-                                lerp(tr.start_alpha_mul, target_alpha, ease),
-                            )
-                        } else {
-                            let enter_shift = (scaled_h + item_gap).min(46.0 * dpi_scale);
-                            (
-                                lerp(target_y + enter_shift, target_y, ease),
-                                lerp((target_scale * 1.03).min(1.04), target_scale, ease),
-                                lerp(0.0, target_alpha, ease),
-                            )
-                        }
+                    if let Some(tr) = anim.tracks.get(&item.id) {
+                        (
+                            lerp(tr.start_y, target_y, ease),
+                            lerp(tr.start_scale, target_scale, ease),
+                            lerp(tr.start_alpha_mul, target_alpha, ease),
+                        )
                     } else {
-                        (target_y, target_scale, target_alpha)
-                    };
+                        let enter_shift = (scaled_h + item_gap).min(46.0 * dpi_scale);
+                        (
+                            lerp(target_y + enter_shift, target_y, ease),
+                            lerp((target_scale * 1.03).min(1.04), target_scale, ease),
+                            lerp(0.0, target_alpha, ease),
+                        )
+                    }
+                } else {
+                    (target_y, target_scale, target_alpha)
+                };
 
-                    next_snapshots.push(RenderedItemSnapshot {
-                        item: item.clone(),
-                        y: draw_y,
-                        height: block.raw_height * draw_scale,
-                        scale: draw_scale,
-                        alpha_mul: draw_alpha,
-                        age,
-                    });
+                next_snapshots.push(RenderedItemSnapshot {
+                    item: item.clone(),
+                    y: draw_y,
+                    height: block.raw_height * draw_scale,
+                    scale: draw_scale,
+                    alpha_mul: draw_alpha,
+                    age,
+                });
 
-                    draw_block(&rt, &block, draw_y, draw_scale, draw_alpha, wf, pad_x);
-                }
-
-                rt.PopAxisAlignedClip();
+                draw_block(rt, &block, draw_y, draw_scale, draw_alpha, wf, pad_x);
             }
 
-            if rt.EndDraw(None, None).is_err() {
-                return;
-            }
+            rt.PopAxisAlignedClip();
         }
 
-        // Copy WIC bitmap PBGRA bytes into 32-bit DIBSection for UpdateLayeredWindow
-        unsafe {
-            let lock_rect = WICRect {
-                X: 0,
-                Y: 0,
-                Width: w as i32,
-                Height: h as i32,
-            };
-            let Ok(lock) = wic_bmp.Lock(&lock_rect, WICBitmapLockRead.0 as u32) else {
-                return;
-            };
-            let mut buf_sz = 0u32;
-            let mut ptr: *mut u8 = null_mut();
-            if lock.GetDataPointer(&mut buf_sz, &mut ptr).is_err() || ptr.is_null() {
-                return;
+        if rt.EndDraw(None, None).is_err() {
+            if st.surface.is_none() {
+                st.surface = Some(surface);
             }
+            return;
+        }
+
+        if !no_speech_yet {
+            st.last_snapshots = next_snapshots;
+            if anim_finished {
+                st.scroll_anim = None;
+            }
+        } else {
+            st.last_snapshots.clear();
+        }
+        (anim_finished, st.fade_alpha)
+    };
+
+    if anim_finished {
+        sync_anim_timer_win32(hwnd, state_rc);
+    }
+
+    // Copy WIC bitmap PBGRA bytes into cached DIBSection and call UpdateLayeredWindow with no borrow held
+    let lock_rect = WICRect {
+        X: 0,
+        Y: 0,
+        Width: w as i32,
+        Height: h as i32,
+    };
+    if let Ok(lock) = surface.wic_bmp.Lock(&lock_rect, WICBitmapLockRead.0 as u32) {
+        let mut buf_sz = 0u32;
+        let mut ptr: *mut u8 = null_mut();
+        if lock.GetDataPointer(&mut buf_sz, &mut ptr).is_ok() && !ptr.is_null() {
             let src_stride = lock.GetStride().unwrap_or(w * 4) as usize;
-
-            let mut bmi = BITMAPINFO::default();
-            bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-            bmi.bmiHeader.biWidth = w as i32;
-            bmi.bmiHeader.biHeight = -(h as i32);
-            bmi.bmiHeader.biPlanes = 1;
-            bmi.bmiHeader.biBitCount = 32;
-            bmi.bmiHeader.biCompression = BI_RGB.0;
-
-            let mut bits_ptr: *mut core::ffi::c_void = null_mut();
-            let Ok(hbm) = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0)
-            else {
-                return;
-            };
-            if hbm.is_invalid() || bits_ptr.is_null() {
-                if !hbm.is_invalid() {
-                    let _ = DeleteObject(hbm);
-                }
-                return;
-            }
-
             let dst_stride = (w * 4) as usize;
             let src_slice = std::slice::from_raw_parts(ptr, (h as usize) * src_stride);
-            let dst_slice = std::slice::from_raw_parts_mut(bits_ptr as *mut u8, (h as usize) * dst_stride);
+            let dst_slice =
+                std::slice::from_raw_parts_mut(surface.bits_ptr, (h as usize) * dst_stride);
             if src_stride == dst_stride {
                 dst_slice.copy_from_slice(&src_slice[..dst_slice.len()]);
             } else {
@@ -1213,16 +1298,8 @@ impl OverlayInner {
                         .copy_from_slice(&src_slice[s0..s0 + dst_stride]);
                 }
             }
+            drop(lock);
 
-            let mem_dc = CreateCompatibleDC(None);
-            let old_obj = SelectObject(mem_dc, hbm);
-
-            let mut win_rect = RECT::default();
-            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(self.hwnd, &mut win_rect);
-            let pt_dst = POINT {
-                x: win_rect.left,
-                y: win_rect.top,
-            };
             let sz = SIZE {
                 cx: w as i32,
                 cy: h as i32,
@@ -1231,81 +1308,156 @@ impl OverlayInner {
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
                 BlendFlags: 0,
-                SourceConstantAlpha: self.fade_alpha,
+                SourceConstantAlpha: fade_alpha,
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
             let _ = UpdateLayeredWindow(
-                self.hwnd,
+                hwnd,
                 None,
-                Some(&pt_dst),
+                None,
                 Some(&sz),
-                mem_dc,
+                surface.mem_dc,
                 Some(&pt_src),
                 COLORREF(0),
                 Some(&blend),
                 ULW_ALPHA,
             );
-
-            SelectObject(mem_dc, old_obj);
-            let _ = DeleteDC(mem_dc);
-            let _ = DeleteObject(hbm);
         }
+    }
 
-        if !no_speech_yet {
-            self.last_snapshots = next_snapshots;
-            if anim_finished {
-                self.scroll_anim = None;
-                self.sync_anim_timer();
+    let mut st = state_rc.borrow_mut();
+    if st.surface.is_none() {
+        st.surface = Some(surface);
+    }
+}
+
+unsafe fn tick_autohide(hwnd: HWND, state_rc: &Rc<RefCell<OverlayInner>>) {
+    let (need_render, need_hide) = {
+        let mut st = state_rc.borrow_mut();
+        if st.cfg.auto_hide_sec <= 0.05 || !st.cfg.visible {
+            return;
+        }
+        if st.hovered && !st.cfg.click_through {
+            st.last_activity = Instant::now();
+            if st.fade_alpha < 255 {
+                st.fade_alpha = 255;
+                st.fading_started_at = None;
+                (true, false)
+            } else {
+                (false, false)
             }
         } else {
-            self.last_snapshots.clear();
+            let elapsed = st.last_activity.elapsed().as_secs_f32();
+            if elapsed < st.cfg.auto_hide_sec {
+                (false, false)
+            } else {
+                match st.cfg.hide_animation {
+                    HideAnimation::None => {
+                        st.hidden_by_autohide = true;
+                        st.fade_alpha = 0;
+                        (false, true)
+                    }
+                    HideAnimation::Fade => {
+                        let fade_start =
+                            *st.fading_started_at.get_or_insert_with(Instant::now);
+                        let dur = (st.cfg.hide_duration_ms.max(50) as f32) / 1000.0;
+                        let t = (fade_start.elapsed().as_secs_f32() / dur).clamp(0.0, 1.0);
+                        let next_alpha = ((1.0 - t) * 255.0).round() as u8;
+                        let changed = next_alpha != st.fade_alpha;
+                        if changed {
+                            st.fade_alpha = next_alpha;
+                        }
+                        if t >= 1.0 {
+                            st.hidden_by_autohide = true;
+                            (false, true)
+                        } else {
+                            (changed, false)
+                        }
+                    }
+                }
+            }
         }
+    };
+
+    if need_hide {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        sync_autohide_timer_win32(hwnd, false);
+        sync_anim_timer_win32(hwnd, state_rc);
+    } else if need_render {
+        render_overlay(state_rc);
     }
 }
 
 unsafe fn drain_commands(state_rc: &Rc<RefCell<OverlayInner>>) {
     let cmds: Vec<OverlayCmd> = {
         let state = state_rc.borrow();
-        let mut q = state.cmd_queue.lock().unwrap();
+        let mut q = state
+            .cmd_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *q)
     };
 
     for cmd in cmds {
         match cmd {
             OverlayCmd::SetPayload(payload) => {
-                state_rc.borrow_mut().apply_payload(payload);
+                let (hwnd, show_now, want_timer) =
+                    state_rc.borrow_mut().prepare_payload_update(payload);
+                if show_now {
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                }
+                sync_autohide_timer_win32(hwnd, want_timer);
+                sync_anim_timer_win32(hwnd, state_rc);
+                render_overlay(state_rc);
             }
             OverlayCmd::SetConfig(cfg) => {
-                let mut st = state_rc.borrow_mut();
-                let vis_changed = st.cfg.visible != cfg.visible;
-                st.cfg = cfg;
-                if !st.cfg.smooth_scroll {
-                    st.scroll_anim = None;
-                }
-                if vis_changed && st.cfg.visible {
-                    st.hidden_by_autohide = false;
-                    st.fade_alpha = 255;
-                    st.last_activity = Instant::now();
-                }
-                st.apply_window_styles();
-                st.sync_timer();
-                st.sync_anim_timer();
-                st.render();
+                let (hwnd, click_through, top_most, should_show, want_timer) = {
+                    let mut st = state_rc.borrow_mut();
+                    let vis_changed = st.cfg.visible != cfg.visible;
+                    let autohide_changed =
+                        (st.cfg.auto_hide_sec - cfg.auto_hide_sec).abs() > 0.01
+                            || st.cfg.hide_animation != cfg.hide_animation
+                            || st.cfg.hide_duration_ms != cfg.hide_duration_ms;
+                    st.cfg = cfg;
+                    if !st.cfg.smooth_scroll {
+                        st.scroll_anim = None;
+                    }
+                    if (vis_changed && st.cfg.visible)
+                        || (st.hidden_by_autohide && st.cfg.auto_hide_sec <= 0.05)
+                    {
+                        let _ = st.reset_autohide_state();
+                    } else if autohide_changed || vis_changed {
+                        st.fading_started_at = None;
+                        st.fade_alpha = 255;
+                    }
+                    let should_show = st.cfg.visible && !st.hidden_by_autohide;
+                    (
+                        st.hwnd,
+                        st.cfg.click_through,
+                        st.cfg.top_most,
+                        should_show,
+                        st.wants_autohide_timer(),
+                    )
+                };
+                apply_window_styles_win32(hwnd, click_through, top_most, should_show);
+                sync_autohide_timer_win32(hwnd, want_timer);
+                sync_anim_timer_win32(hwnd, state_rc);
+                render_overlay(state_rc);
             }
             OverlayCmd::ApplyRect(rect) => {
                 let hwnd = state_rc.borrow().hwnd;
                 apply_window_rect(hwnd.0 as isize, rect);
-                let mut st = state_rc.borrow_mut();
-                st.scroll_anim = None;
-                st.sync_anim_timer();
-                st.render();
+                state_rc.borrow_mut().scroll_anim = None;
+                sync_anim_timer_win32(hwnd, state_rc);
+                render_overlay(state_rc);
             }
             OverlayCmd::Shutdown => {
-                let mut st = state_rc.borrow_mut();
-                st.scroll_anim = None;
-                st.sync_anim_timer();
-                let hwnd = st.hwnd;
-                drop(st);
+                let hwnd = {
+                    let mut st = state_rc.borrow_mut();
+                    st.scroll_anim = None;
+                    st.hwnd
+                };
+                sync_anim_timer_win32(hwnd, state_rc);
                 let _ = DestroyWindow(hwnd);
             }
         }
@@ -1318,19 +1470,22 @@ unsafe extern "system" fn overlay_wnd_proc(
     w_param: WPARAM,
     l_param: LPARAM,
 ) -> LRESULT {
-    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<OverlayInner>;
-    if ptr.is_null() {
-        return DefWindowProcW(hwnd, msg, w_param, l_param);
-    }
-    let state_rc = ManuallyDrop::new(Rc::from_raw(ptr));
-    let _guard = Rc::clone(&state_rc);
-    let res = handle_overlay_msg(hwnd, msg, w_param, l_param, &state_rc);
-    if msg == WM_NCDESTROY {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-        drop(Rc::from_raw(ptr));
-        windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
-    }
-    res
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<OverlayInner>;
+        if ptr.is_null() {
+            return DefWindowProcW(hwnd, msg, w_param, l_param);
+        }
+        let state_rc = ManuallyDrop::new(Rc::from_raw(ptr));
+        let _guard = Rc::clone(&state_rc);
+        let res = handle_overlay_msg(hwnd, msg, w_param, l_param, &state_rc);
+        if msg == WM_NCDESTROY {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            drop(Rc::from_raw(ptr));
+            windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
+        }
+        res
+    }));
+    res.unwrap_or_else(|_| DefWindowProcW(hwnd, msg, w_param, l_param))
 }
 
 unsafe fn handle_overlay_msg(
@@ -1343,6 +1498,13 @@ unsafe fn handle_overlay_msg(
     match msg {
         WM_APP_UPDATE_TEXT | WM_APP_UPDATE_CFG | WM_APP_SET_RECT | WM_APP_QUIT => {
             drain_commands(state_rc);
+            LRESULT(0)
+        }
+        WM_GETMINMAXINFO => {
+            let mmi = l_param.0 as *mut MINMAXINFO;
+            if !mmi.is_null() {
+                (*mmi).ptMinTrackSize = POINT { x: 260, y: 72 };
+            }
             LRESULT(0)
         }
         WM_NCHITTEST => {
@@ -1379,45 +1541,56 @@ unsafe fn handle_overlay_msg(
             LRESULT(code as isize)
         }
         WM_MOUSEMOVE | WM_NCMOUSEMOVE => {
-            let mut st = state_rc.borrow_mut();
-            if !st.tracking_leave {
-                let flags = if msg == WM_NCMOUSEMOVE {
-                    TME_LEAVE | TME_NONCLIENT
-                } else {
-                    TME_LEAVE
-                };
-                let mut tme = TRACKMOUSEEVENT {
-                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: flags,
-                    hwndTrack: hwnd,
-                    dwHoverTime: 0,
-                };
-                if TrackMouseEvent(&mut tme).is_ok() {
-                    st.tracking_leave = true;
+            let need_render = {
+                let mut st = state_rc.borrow_mut();
+                if !st.tracking_leave {
+                    let flags = if msg == WM_NCMOUSEMOVE {
+                        TME_LEAVE | TME_NONCLIENT
+                    } else {
+                        TME_LEAVE
+                    };
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: flags,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    if TrackMouseEvent(&mut tme).is_ok() {
+                        st.tracking_leave = true;
+                    }
                 }
-            }
-            if !st.hovered {
-                st.hovered = true;
-                st.render();
+                if !st.hovered {
+                    st.hovered = true;
+                    true
+                } else {
+                    false
+                }
+            };
+            if need_render {
+                render_overlay(state_rc);
             }
             LRESULT(0)
         }
         WM_MOUSELEAVE | WM_NCMOUSELEAVE => {
-            let mut st = state_rc.borrow_mut();
-            st.tracking_leave = false;
-            if st.hovered {
-                st.hovered = false;
-                st.render();
+            let need_render = {
+                let mut st = state_rc.borrow_mut();
+                st.tracking_leave = false;
+                if st.hovered {
+                    st.hovered = false;
+                    true
+                } else {
+                    false
+                }
+            };
+            if need_render {
+                render_overlay(state_rc);
             }
             LRESULT(0)
         }
         WM_SIZE => {
-            {
-                let mut st = state_rc.borrow_mut();
-                st.scroll_anim = None;
-                st.sync_anim_timer();
-                st.render();
-            }
+            state_rc.borrow_mut().scroll_anim = None;
+            sync_anim_timer_win32(hwnd, state_rc);
+            render_overlay(state_rc);
             if let Some(ws) = query_window_state(hwnd.0 as isize) {
                 let on_ev = Arc::clone(&state_rc.borrow().on_event);
                 on_ev(OverlayEvent::GeometryChanged(ws));
@@ -1445,10 +1618,9 @@ unsafe fn handle_overlay_msg(
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
-            let mut st = state_rc.borrow_mut();
-            st.scroll_anim = None;
-            st.sync_anim_timer();
-            st.render();
+            state_rc.borrow_mut().scroll_anim = None;
+            sync_anim_timer_win32(hwnd, state_rc);
+            render_overlay(state_rc);
             LRESULT(0)
         }
         WM_DISPLAYCHANGE => {
@@ -1464,21 +1636,18 @@ unsafe fn handle_overlay_msg(
                 FallbackPlacement::BottomCenterPrimary { bottom_margin: 48 },
             );
             apply_window_rect(hwnd.0 as isize, resolved);
-            {
-                let mut st = state_rc.borrow_mut();
-                st.scroll_anim = None;
-                st.sync_anim_timer();
-                st.render();
-            }
+            state_rc.borrow_mut().scroll_anim = None;
+            sync_anim_timer_win32(hwnd, state_rc);
+            render_overlay(state_rc);
             let on_ev = Arc::clone(&state_rc.borrow().on_event);
             on_ev(OverlayEvent::DisplayChanged);
             LRESULT(0)
         }
         WM_TIMER => {
             if w_param.0 == TIMER_AUTOHIDE_ID {
-                state_rc.borrow_mut().tick_autohide();
+                tick_autohide(hwnd, state_rc);
             } else if w_param.0 == TIMER_ANIM_ID {
-                state_rc.borrow_mut().render();
+                render_overlay(state_rc);
             }
             LRESULT(0)
         }
@@ -1489,19 +1658,18 @@ unsafe fn handle_overlay_msg(
 fn overlay_thread_main(
     initial_cfg: OverlayConfig,
     saved_window: Option<WindowState>,
-    cmd_queue: Arc<std::sync::Mutex<Vec<OverlayCmd>>>,
+    cmd_queue: Arc<Mutex<Vec<OverlayCmd>>>,
     hwnd_tx: Sender<Result<isize>>,
     on_event: Arc<dyn Fn(OverlayEvent) + Send + Sync>,
 ) {
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let _com_guard = ComInitGuard(CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok());
 
         let d2d_factory: ID2D1Factory =
             match D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) {
                 Ok(f) => f,
                 Err(e) => {
                     let _ = hwnd_tx.send(Err(anyhow!("D2D1CreateFactory failed: {e}")));
-                    CoUninitialize();
                     return;
                 }
             };
@@ -1510,7 +1678,6 @@ fn overlay_thread_main(
                 Ok(f) => f,
                 Err(e) => {
                     let _ = hwnd_tx.send(Err(anyhow!("DWriteCreateFactory failed: {e}")));
-                    CoUninitialize();
                     return;
                 }
             };
@@ -1519,7 +1686,6 @@ fn overlay_thread_main(
                 Ok(f) => f,
                 Err(e) => {
                     let _ = hwnd_tx.send(Err(anyhow!("WICImagingFactory failed: {e}")));
-                    CoUninitialize();
                     return;
                 }
             };
@@ -1573,11 +1739,11 @@ fn overlay_thread_main(
             hinstance,
             None,
         ) else {
+            let _ = UnregisterClassW(class_name, hinstance);
             if !hicon.is_invalid() {
                 let _ = DestroyIcon(hicon);
             }
             let _ = hwnd_tx.send(Err(anyhow!("Failed to create subtitle overlay window")));
-            CoUninitialize();
             return;
         };
 
@@ -1598,6 +1764,7 @@ fn overlay_thread_main(
             dw_factory,
             wic_factory,
             cached_bg: None,
+            surface: None,
             cmd_queue,
             on_event,
         }));
@@ -1605,45 +1772,53 @@ fn overlay_thread_main(
         let raw_rc = Rc::into_raw(Rc::clone(&inner));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw_rc as isize);
 
-        {
-            let mut st = inner.borrow_mut();
-            st.apply_window_styles();
-            st.sync_timer();
-            st.render();
-        }
+        let (click_through, top_most, should_show, want_timer) = {
+            let st = inner.borrow();
+            (
+                st.cfg.click_through,
+                st.cfg.top_most,
+                st.cfg.visible && !st.hidden_by_autohide,
+                st.wants_autohide_timer(),
+            )
+        };
+        apply_window_styles_win32(hwnd, click_through, top_most, should_show);
+        sync_autohide_timer_win32(hwnd, want_timer);
+        render_overlay(&inner);
 
         let _ = hwnd_tx.send(Ok(hwnd.0 as isize));
 
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
 
+        drop(inner);
+        let _ = UnregisterClassW(class_name, hinstance);
         if !hicon.is_invalid() {
             let _ = DestroyIcon(hicon);
         }
-        CoUninitialize();
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct FinalizedLine<'a> {
+    pub id: u64,
     pub original: &'a str,
     pub translation: &'a str,
 }
 
 /// Coordinates subtitle display with smooth multi-line chronological history (`max_lines` 1..=4):
-/// - **Multi-Line Smooth Scroll Crawl** (`max_lines >= 2` + `PrefixLockedFill`): assigns
-///   monotonic item IDs (`1, 2, 3...`) so live interim lines confirm in-place to final
-///   without shifting IDs or flashing, then smoothly scroll upward as newer speech enters
-///   at the bottom. `min_display_sec` paces back-to-back finalized sentences so rapidly
-///   completed lines remain readable before scrolling off.
+/// - **Multi-Line Smooth Scroll Crawl** (`max_lines >= 2` + `PrefixLockedFill`): uses monotonic
+///   entry IDs so live interim lines confirm in-place to final without shifting IDs or flashing,
+///   even after rolling past the 500-entry transcript window, then smoothly scroll upward as
+///   newer speech enters at the bottom. `min_display_sec` paces back-to-back finalized sentences
+///   so rapidly completed lines remain readable before scrolling off.
 /// - **Single-line / CleanSentencesOnly**: holds finalized lines for `min_display_sec`
 ///   and catches up cleanly during rapid bursts.
 #[derive(Debug, Default)]
 pub struct OverlayDisplayHold {
-    displayed_finals: usize,
+    displayed_final_id: u64,
     final_shown_at: Option<Instant>,
 }
 
@@ -1663,19 +1838,19 @@ impl OverlayDisplayHold {
     ) -> (OverlayPayload, bool) {
         let max_lines = max_lines.clamp(1, 4);
 
-        if transcript.len() < self.displayed_finals {
-            self.displayed_finals = transcript.len();
-            self.final_shown_at = if self.displayed_finals > 0 {
-                Some(now)
-            } else {
-                None
-            };
+        if transcript.is_empty() {
+            self.displayed_final_id = 0;
+            self.final_shown_at = None;
+        } else if transcript.last().is_some_and(|r| r.id < self.displayed_final_id) {
+            self.displayed_final_id = transcript.last().unwrap().id;
+            self.final_shown_at = Some(now);
         }
 
-        let pending = transcript.len().saturating_sub(self.displayed_finals);
+        let shown_len = transcript.partition_point(|row| row.id <= self.displayed_final_id);
+        let pending = transcript.len().saturating_sub(shown_len);
         if pending > 0 {
-            if self.displayed_finals == 0 || min_display_sec <= 0.01 {
-                self.displayed_finals = transcript.len();
+            if self.displayed_final_id == 0 || min_display_sec <= 0.01 {
+                self.displayed_final_id = transcript.last().unwrap().id;
                 self.final_shown_at = Some(now);
             } else {
                 let elapsed = self
@@ -1689,22 +1864,27 @@ impl OverlayDisplayHold {
                 };
                 if elapsed >= effective_dwell {
                     if pending >= 3 {
-                        self.displayed_finals = transcript.len() - 1;
+                        self.displayed_final_id = transcript[transcript.len() - 2].id;
                     } else {
-                        self.displayed_finals += 1;
+                        self.displayed_final_id = transcript[shown_len].id;
                     }
                     self.final_shown_at = Some(now);
                 }
             }
         }
 
+        let shown_len = transcript.partition_point(|row| row.id <= self.displayed_final_id);
         let elapsed = self
             .final_shown_at
             .map(|t| now.saturating_duration_since(t).as_secs_f32())
             .unwrap_or(f32::MAX);
         let holding_final =
-            min_display_sec > 0.01 && self.displayed_finals > 0 && elapsed < min_display_sec;
-        let has_unshown_finals = self.displayed_finals < transcript.len();
+            min_display_sec > 0.01 && shown_len > 0 && elapsed < min_display_sec;
+        let has_unshown_finals = shown_len < transcript.len();
+        let next_live_id = self
+            .displayed_final_id
+            .max(transcript.last().map_or(0, |r| r.id))
+            + 1;
 
         let has_active_interim = match live_style {
             LiveSubtitleStyle::CleanSentencesOnly => !shows_tl && !interim_original.is_empty(),
@@ -1726,7 +1906,7 @@ impl OverlayDisplayHold {
             };
             let confirmed_tl_bytes = translation.len();
             OverlayLineItem {
-                id: (idx as u64) + 1,
+                id: row.id,
                 original: row.original.to_string(),
                 translation,
                 confirmed_tl_bytes,
@@ -1751,20 +1931,19 @@ impl OverlayDisplayHold {
         // and newest interims scroll older translations cleanly upward.
         if max_lines >= 2 && live_style == LiveSubtitleStyle::PrefixLockedFill {
             if has_unshown_finals {
-                let end = (self.displayed_finals + 1).min(transcript.len());
+                let end = (shown_len + 1).min(transcript.len());
                 let start = end.saturating_sub(max_lines);
                 let items = (start..end).map(make_fin).collect();
                 return (OverlayPayload { items }, true);
             } else if has_active_interim {
-                let fin_keep = self.displayed_finals.min(max_lines - 1);
-                let start = self.displayed_finals.saturating_sub(fin_keep);
-                let mut items: Vec<OverlayLineItem> =
-                    (start..self.displayed_finals).map(make_fin).collect();
-                items.push(make_interim((self.displayed_finals as u64) + 1));
+                let fin_keep = shown_len.min(max_lines - 1);
+                let start = shown_len.saturating_sub(fin_keep);
+                let mut items: Vec<OverlayLineItem> = (start..shown_len).map(make_fin).collect();
+                items.push(make_interim(next_live_id));
                 return (OverlayPayload { items }, false);
             } else {
-                let start = self.displayed_finals.saturating_sub(max_lines);
-                let items = (start..self.displayed_finals).map(make_fin).collect();
+                let start = shown_len.saturating_sub(max_lines);
+                let items = (start..shown_len).map(make_fin).collect();
                 return (OverlayPayload { items }, false);
             }
         }
@@ -1773,15 +1952,14 @@ impl OverlayDisplayHold {
         // chronologically (unless Original-only mode is showing live interim).
         if max_lines >= 2 {
             let items = if has_active_interim && !holding_final && !has_unshown_finals {
-                let fin_keep = self.displayed_finals.min(max_lines - 1);
-                let start = self.displayed_finals.saturating_sub(fin_keep);
-                let mut v: Vec<OverlayLineItem> =
-                    (start..self.displayed_finals).map(make_fin).collect();
-                v.push(make_interim((self.displayed_finals as u64) + 1));
+                let fin_keep = shown_len.min(max_lines - 1);
+                let start = shown_len.saturating_sub(fin_keep);
+                let mut v: Vec<OverlayLineItem> = (start..shown_len).map(make_fin).collect();
+                v.push(make_interim(next_live_id));
                 v
             } else {
-                let start = self.displayed_finals.saturating_sub(max_lines);
-                (start..self.displayed_finals).map(make_fin).collect()
+                let start = shown_len.saturating_sub(max_lines);
+                (start..shown_len).map(make_fin).collect()
             };
             let pending_transition = has_unshown_finals || (holding_final && has_active_interim);
             return (OverlayPayload { items }, pending_transition);
@@ -1789,9 +1967,9 @@ impl OverlayDisplayHold {
 
         // Case 3: Single-line mode (max_lines == 1)
         let items = if has_active_interim && !holding_final && !has_unshown_finals {
-            vec![make_interim((self.displayed_finals as u64) + 1)]
-        } else if self.displayed_finals > 0 {
-            vec![make_fin(self.displayed_finals - 1)]
+            vec![make_interim(next_live_id)]
+        } else if shown_len > 0 {
+            vec![make_fin(shown_len - 1)]
         } else if has_active_interim {
             vec![make_interim(1)]
         } else {
@@ -1808,8 +1986,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn fl<'a>(o: &'a str, t: &'a str) -> FinalizedLine<'a> {
+    fn fl<'a>(id: u64, o: &'a str, t: &'a str) -> FinalizedLine<'a> {
         FinalizedLine {
+            id,
             original: o,
             translation: t,
         }
@@ -1838,7 +2017,7 @@ mod tests {
         assert!(!p_s1_live.items[0].is_final);
 
         // S1 finishes -> SAME id=1 in-place!
-        let tr1 = vec![fl("o1", "First finished!")];
+        let tr1 = vec![fl(1, "o1", "First finished!")];
         let (p_s1_fin, pend) = hold.resolve(
             t0 + Duration::from_millis(500),
             &tr1,
@@ -1876,7 +2055,7 @@ mod tests {
         assert!(!p_s2_live.items[1].is_final);
 
         // S2 finishes -> [1 (final), 2 (final)]
-        let tr2 = vec![fl("o1", "First finished!"), fl("o2", "Second finished!")];
+        let tr2 = vec![fl(1, "o1", "First finished!"), fl(2, "o2", "Second finished!")];
         let (p_s2_fin, pend) = hold.resolve(
             t0 + Duration::from_millis(2000),
             &tr2,
@@ -1912,9 +2091,9 @@ mod tests {
         );
 
         let tr3 = vec![
-            fl("o1", "First finished!"),
-            fl("o2", "Second finished!"),
-            fl("o3", "Third finished!"),
+            fl(1, "o1", "First finished!"),
+            fl(2, "o2", "Second finished!"),
+            fl(3, "o3", "Third finished!"),
         ];
         let (p_s3_fin, _) = hold.resolve(
             t0 + Duration::from_millis(3400),
@@ -1959,9 +2138,9 @@ mod tests {
         let mut hold = OverlayDisplayHold::default();
         let t0 = Instant::now();
         let tr3 = vec![
-            fl("o1", "One!"),
-            fl("o2", "Two!"),
-            fl("o3", "Three!"),
+            fl(1, "o1", "One!"),
+            fl(2, "o2", "Two!"),
+            fl(3, "o3", "Three!"),
         ];
         let _ = hold.resolve(
             t0,
@@ -1995,10 +2174,10 @@ mod tests {
         // S4 finishes quickly at 400ms (before 1.2s min_display_sec):
         // S4 turns solid in-place ([2, 3, 4(final)]) and stays readable even if S5 starts at 600ms!
         let tr4 = vec![
-            fl("o1", "One!"),
-            fl("o2", "Two!"),
-            fl("o3", "Three!"),
-            fl("o4", "Four done!"),
+            fl(1, "o1", "One!"),
+            fl(2, "o2", "Two!"),
+            fl(3, "o3", "Three!"),
+            fl(4, "o4", "Four done!"),
         ];
         let (p_fin4, pend4) = hold.resolve(
             t0 + Duration::from_millis(400),
@@ -2059,7 +2238,7 @@ mod tests {
     fn single_line_mode_holds_final_before_allowing_next_interim() {
         let mut hold = OverlayDisplayHold::default();
         let t0 = Instant::now();
-        let tr = vec![fl("src1", "First sentence!")];
+        let tr = vec![fl(1, "src1", "First sentence!")];
 
         let (p0, pend0) = hold.resolve(
             t0,
@@ -2116,7 +2295,7 @@ mod tests {
     fn clean_sentences_three_line_paces_and_catches_up_bursts() {
         let mut hold = OverlayDisplayHold::default();
         let t0 = Instant::now();
-        let tr1 = vec![fl("s1", "One!")];
+        let tr1 = vec![fl(1, "s1", "One!")];
         let _ = hold.resolve(
             t0,
             &tr1,
@@ -2130,7 +2309,7 @@ mod tests {
         );
 
         // 100ms later, second final arrives: keep showing [One!] until dwell expires
-        let tr2 = vec![fl("s1", "One!"), fl("s2", "Two!")];
+        let tr2 = vec![fl(1, "s1", "One!"), fl(2, "s2", "Two!")];
         let (p_hold, pend) = hold.resolve(
             t0 + Duration::from_millis(100),
             &tr2,
@@ -2166,11 +2345,11 @@ mod tests {
 
         // Burst of 5 finals catches up cleanly ([Two!, Three!, Four!], keeping Five! next)
         let tr5 = vec![
-            fl("s1", "One!"),
-            fl("s2", "Two!"),
-            fl("s3", "Three!"),
-            fl("s4", "Four!"),
-            fl("s5", "Five!"),
+            fl(1, "s1", "One!"),
+            fl(2, "s2", "Two!"),
+            fl(3, "s3", "Three!"),
+            fl(4, "s4", "Four!"),
+            fl(5, "s5", "Five!"),
         ];
         let (p_burst, pend_burst) = hold.resolve(
             t0 + Duration::from_millis(2300),
@@ -2198,7 +2377,7 @@ mod tests {
     fn zero_min_display_and_clear_reset_work_cleanly() {
         let mut hold = OverlayDisplayHold::default();
         let t0 = Instant::now();
-        let mut tr = vec![fl("s1", "One!")];
+        let mut tr = vec![fl(1, "s1", "One!")];
         let _ = hold.resolve(
             t0,
             &tr,
@@ -2240,6 +2419,79 @@ mod tests {
         );
         assert_eq!(empty, OverlayPayload::default());
         assert!(!pend_e);
+    }
+
+    #[test]
+    fn rolling_500_entry_window_preserves_monotonic_ids_and_dwell_pacing() {
+        let mut hold = OverlayDisplayHold::default();
+        let t0 = Instant::now();
+
+        let window1: Vec<(u64, String, String)> = (2u64..=501)
+            .map(|id| (id, format!("src{id}"), format!("tl{id}")))
+            .collect();
+        let refs1: Vec<FinalizedLine<'_>> = window1
+            .iter()
+            .map(|(id, o, t)| fl(*id, o, t))
+            .collect();
+        let (p1, _) = hold.resolve(
+            t0,
+            &refs1,
+            "",
+            "",
+            0,
+            LiveSubtitleStyle::PrefixLockedFill,
+            true,
+            3,
+            1.2,
+        );
+        assert_eq!(
+            p1.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![499, 500, 501]
+        );
+
+        // Utterance 502 streams live as id=502
+        let (p2_live, _) = hold.resolve(
+            t0 + Duration::from_millis(100),
+            &refs1,
+            "src502",
+            "tl502 live",
+            4,
+            LiveSubtitleStyle::PrefixLockedFill,
+            true,
+            3,
+            1.2,
+        );
+        assert_eq!(
+            p2_live.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![500, 501, 502]
+        );
+
+        // Utterance 502 finalizes and window slides to 3..=502: id=502 stays 502 in-place with pending=true!
+        let window2: Vec<(u64, String, String)> = (3u64..=502)
+            .map(|id| (id, format!("src{id}"), format!("tl{id}")))
+            .collect();
+        let refs2: Vec<FinalizedLine<'_>> = window2
+            .iter()
+            .map(|(id, o, t)| fl(*id, o, t))
+            .collect();
+        let (p2_fin, pend2) = hold.resolve(
+            t0 + Duration::from_millis(300),
+            &refs2,
+            "",
+            "",
+            0,
+            LiveSubtitleStyle::PrefixLockedFill,
+            true,
+            3,
+            1.2,
+        );
+        assert!(pend2);
+        assert_eq!(
+            p2_fin.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![500, 501, 502]
+        );
+        assert!(p2_fin.items[2].is_final);
+        assert_eq!(p2_fin.items[2].translation, "tl502");
     }
 
     #[test]

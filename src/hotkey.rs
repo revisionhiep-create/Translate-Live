@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Result};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -20,9 +21,7 @@ const HOTKEY_CAPTURE_ID: i32 = 1;
 const HOTKEY_OVERLAY_ID: i32 = 2;
 const HOTKEY_CLICK_THROUGH_ID: i32 = 3;
 
-const WM_APP_SET_CAPTURE: u32 = WM_APP + 1;
-const WM_APP_SET_OVERLAY: u32 = WM_APP + 2;
-const WM_APP_SET_CLICK_THROUGH: u32 = WM_APP + 3;
+const WM_APP_PROCESS_QUEUE: u32 = WM_APP + 1;
 const WM_APP_QUIT: u32 = WM_APP + 4;
 
 #[derive(Debug, Clone, Copy)]
@@ -32,12 +31,18 @@ pub enum HotkeyEvent {
     ToggleClickThrough,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum HotkeySlot {
+    Capture,
+    Overlay,
+    ClickThrough,
+}
+
+type CmdQueue = Arc<Mutex<VecDeque<(HotkeySlot, Option<HotkeyBinding>, Sender<Result<()>>)>>>;
+
 pub struct HotkeyController {
     thread_id: u32,
-    pending_reply: Arc<Mutex<Option<Sender<Result<()>>>>>,
-    capture_binding: Arc<Mutex<Option<HotkeyBinding>>>,
-    overlay_binding: Arc<Mutex<Option<HotkeyBinding>>>,
-    click_through_binding: Arc<Mutex<Option<HotkeyBinding>>>,
+    cmd_queue: CmdQueue,
     join: Option<JoinHandle<()>>,
 }
 
@@ -47,28 +52,13 @@ impl HotkeyController {
         notify: Arc<dyn Fn(HotkeyEvent) + Send + Sync>,
     ) -> Result<Self> {
         let (tid_tx, tid_rx) = mpsc::channel();
-        let pending_reply: Arc<Mutex<Option<Sender<Result<()>>>>> = Arc::new(Mutex::new(None));
-        let capture_binding = Arc::new(Mutex::new(None));
-        let overlay_binding = Arc::new(Mutex::new(None));
-        let click_through_binding = Arc::new(Mutex::new(None));
-
-        let pending_c = Arc::clone(&pending_reply);
-        let cap_c = Arc::clone(&capture_binding);
-        let ov_c = Arc::clone(&overlay_binding);
-        let ct_c = Arc::clone(&click_through_binding);
+        let cmd_queue: CmdQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let queue_c = Arc::clone(&cmd_queue);
 
         let join = thread::Builder::new()
             .name("hotkey-loop".to_string())
             .spawn(move || {
-                hotkey_thread(
-                    tid_tx,
-                    pending_c,
-                    cap_c,
-                    ov_c,
-                    ct_c,
-                    recording_hotkey,
-                    notify,
-                );
+                hotkey_thread(tid_tx, queue_c, recording_hotkey, notify);
             })
             .map_err(|e| anyhow!("Failed to spawn hotkey thread: {e}"))?;
 
@@ -78,18 +68,14 @@ impl HotkeyController {
 
         Ok(Self {
             thread_id,
-            pending_reply,
-            capture_binding,
-            overlay_binding,
-            click_through_binding,
+            cmd_queue,
             join: Some(join),
         })
     }
 
     fn update_slot(
         &self,
-        slot: &Arc<Mutex<Option<HotkeyBinding>>>,
-        msg_id: u32,
+        slot: HotkeySlot,
         label: &str,
         binding: Option<HotkeyBinding>,
     ) -> Result<()> {
@@ -98,12 +84,14 @@ impl HotkeyController {
                 bail!("Invalid {label} hotkey binding: {}", b.display_label());
             }
         }
-        *slot.lock().unwrap() = binding;
 
         let (tx, rx) = mpsc::channel();
-        *self.pending_reply.lock().unwrap() = Some(tx);
+        {
+            let mut q = self.cmd_queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.push_back((slot, binding, tx));
+        }
         unsafe {
-            PostThreadMessageW(self.thread_id, msg_id, WPARAM(0), LPARAM(0))
+            PostThreadMessageW(self.thread_id, WM_APP_PROCESS_QUEUE, WPARAM(0), LPARAM(0))
                 .map_err(|e| anyhow!("Failed to signal {label} hotkey update: {e}"))?;
         }
         rx.recv_timeout(Duration::from_secs(3))
@@ -111,25 +99,15 @@ impl HotkeyController {
     }
 
     pub fn set_capture_hotkey(&self, binding: Option<HotkeyBinding>) -> Result<()> {
-        self.update_slot(&self.capture_binding, WM_APP_SET_CAPTURE, "Live Capture", binding)
+        self.update_slot(HotkeySlot::Capture, "Live Capture", binding)
     }
 
     pub fn set_overlay_hotkey(&self, binding: Option<HotkeyBinding>) -> Result<()> {
-        self.update_slot(
-            &self.overlay_binding,
-            WM_APP_SET_OVERLAY,
-            "Subtitle Overlay",
-            binding,
-        )
+        self.update_slot(HotkeySlot::Overlay, "Subtitle Overlay", binding)
     }
 
     pub fn set_click_through_hotkey(&self, binding: Option<HotkeyBinding>) -> Result<()> {
-        self.update_slot(
-            &self.click_through_binding,
-            WM_APP_SET_CLICK_THROUGH,
-            "Click-Through",
-            binding,
-        )
+        self.update_slot(HotkeySlot::ClickThrough, "Click-Through", binding)
     }
 
     pub fn shutdown(&mut self) {
@@ -145,12 +123,6 @@ impl HotkeyController {
 impl Drop for HotkeyController {
     fn drop(&mut self) {
         self.shutdown();
-    }
-}
-
-fn reply_pending(pending_reply: &Arc<Mutex<Option<Sender<Result<()>>>>>, res: Result<()>) {
-    if let Some(tx) = pending_reply.lock().unwrap().take() {
-        let _ = tx.send(res);
     }
 }
 
@@ -184,12 +156,29 @@ unsafe fn apply_hotkey(id: i32, name: &str, binding: Option<HotkeyBinding>) -> R
     Ok(())
 }
 
+unsafe fn drain_hotkey_queue(cmd_queue: &CmdQueue) {
+    loop {
+        let next = cmd_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+        let Some((slot, binding, reply)) = next else {
+            break;
+        };
+        let res = match slot {
+            HotkeySlot::Capture => apply_hotkey(HOTKEY_CAPTURE_ID, "Live Capture", binding),
+            HotkeySlot::Overlay => apply_hotkey(HOTKEY_OVERLAY_ID, "Subtitle Overlay", binding),
+            HotkeySlot::ClickThrough => {
+                apply_hotkey(HOTKEY_CLICK_THROUGH_ID, "Click-Through", binding)
+            }
+        };
+        let _ = reply.send(res);
+    }
+}
+
 fn hotkey_thread(
     tid_tx: Sender<u32>,
-    pending_reply: Arc<Mutex<Option<Sender<Result<()>>>>>,
-    capture_binding: Arc<Mutex<Option<HotkeyBinding>>>,
-    overlay_binding: Arc<Mutex<Option<HotkeyBinding>>>,
-    click_through_binding: Arc<Mutex<Option<HotkeyBinding>>>,
+    cmd_queue: CmdQueue,
     recording_hotkey: Arc<AtomicBool>,
     notify: Arc<dyn Fn(HotkeyEvent) + Send + Sync>,
 ) {
@@ -203,24 +192,13 @@ fn hotkey_thread(
         let mut last_ov: Option<Instant> = None;
         let mut last_ct: Option<Instant> = None;
 
-        while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+        while GetMessageW(&mut msg, HWND::default(), 0, 0).0 > 0 {
             match msg.message {
-                WM_APP_SET_CAPTURE => {
-                    let b = *capture_binding.lock().unwrap();
-                    let res = apply_hotkey(HOTKEY_CAPTURE_ID, "Live Capture", b);
-                    reply_pending(&pending_reply, res);
-                }
-                WM_APP_SET_OVERLAY => {
-                    let b = *overlay_binding.lock().unwrap();
-                    let res = apply_hotkey(HOTKEY_OVERLAY_ID, "Subtitle Overlay", b);
-                    reply_pending(&pending_reply, res);
-                }
-                WM_APP_SET_CLICK_THROUGH => {
-                    let b = *click_through_binding.lock().unwrap();
-                    let res = apply_hotkey(HOTKEY_CLICK_THROUGH_ID, "Click-Through", b);
-                    reply_pending(&pending_reply, res);
+                WM_APP_PROCESS_QUEUE => {
+                    drain_hotkey_queue(&cmd_queue);
                 }
                 WM_APP_QUIT => {
+                    drain_hotkey_queue(&cmd_queue);
                     let _ = UnregisterHotKey(None, HOTKEY_CAPTURE_ID);
                     let _ = UnregisterHotKey(None, HOTKEY_OVERLAY_ID);
                     let _ = UnregisterHotKey(None, HOTKEY_CLICK_THROUGH_ID);

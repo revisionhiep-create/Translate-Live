@@ -628,11 +628,12 @@ impl EnergyVad {
 
         if hit_max || hit_silence {
             let mut seg = std::mem::take(&mut self.active);
+            let trailing_silence = self.silence_samples;
             self.in_speech = false;
             self.silence_samples = 0;
             if seg.len() >= self.min_speech_samples {
                 if !hit_max && seg.len() > self.silence_limit_samples / 2 {
-                    let trim = (self.silence_samples / 2).min(seg.len() - self.min_speech_samples);
+                    let trim = (trailing_silence / 2).min(seg.len() - self.min_speech_samples);
                     seg.truncate(seg.len() - trim);
                 }
                 return (prob, Some(seg));
@@ -640,6 +641,13 @@ impl EnergyVad {
         }
 
         (prob, None)
+    }
+
+    pub fn reset(&mut self) {
+        self.in_speech = false;
+        self.silence_samples = 0;
+        self.active.clear();
+        self.pre_roll.clear();
     }
 
     pub fn flush(&mut self) -> Option<Vec<f32>> {
@@ -716,7 +724,7 @@ impl AsrWorkerHandle {
     }
 
     pub fn update_config(&self, cfg: AudioVadConfig) {
-        *self.live_cfg.lock().unwrap() = cfg;
+        *self.live_cfg.lock().unwrap_or_else(|e| e.into_inner()) = cfg;
     }
 
     pub fn stop(&mut self) {
@@ -781,6 +789,13 @@ fn asr_worker_loop(
     let _ = ready_tx.send(Ok(()));
 
     let mut energy_vad = EnergyVad::new(&active_cfg);
+    let mut applied_silero_cfg: Option<AudioVadConfig> = if silero_vad.is_some() {
+        Some(active_cfg.clone())
+    } else {
+        None
+    };
+    let mut last_seen_vad_mode = active_cfg.vad_mode;
+    let mut last_silero_attempt_cfg = active_cfg.clone();
     let mut chunk_buf: Vec<f32> = Vec::with_capacity(WINDOW_SAMPLES * 8);
     let mut silero_active_buf: Vec<f32> = Vec::with_capacity(SAMPLE_RATE as usize * 10);
     let mut speech_started = false;
@@ -790,6 +805,7 @@ fn asr_worker_loop(
     let mut smoothed_prob = 0.0f32;
     let mut quiet_start: Option<Instant> = None;
     let mut utterance_id: u64 = 1;
+    let mut utterance_had_interim = false;
     let mut has_new_speech_since_interim = false;
     let mut pause_started_at: Option<Instant> = None;
 
@@ -801,26 +817,63 @@ fn asr_worker_loop(
         };
 
         // Check for live VAD/timing updates from UI
-        let latest = live_cfg.lock().unwrap().clone();
-        if latest.vad_mode != active_cfg.vad_mode
-            || (latest.vad_mode == VadMode::Silero && silero_params_changed(&latest, &active_cfg))
-        {
-            if latest.vad_mode == VadMode::Silero {
-                match create_silero_vad(&silero_path, &latest) {
-                    Ok(v) => silero_vad = Some(v),
-                    Err(err) => on_event(AsrEvent::Error(err.to_string())),
+        let latest = live_cfg.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let ui_mode_changed = latest.vad_mode != last_seen_vad_mode;
+        let silero_param_dirty = latest.vad_mode == VadMode::Silero
+            && (applied_silero_cfg
+                .as_ref()
+                .is_some_and(|c| silero_params_changed(&latest, c))
+                || (silero_vad.is_none() && silero_params_changed(&latest, &last_silero_attempt_cfg)));
+        last_seen_vad_mode = latest.vad_mode;
+
+        let mut next_cfg = latest;
+        if ui_mode_changed || silero_param_dirty {
+            if next_cfg.vad_mode == VadMode::Silero {
+                last_silero_attempt_cfg = next_cfg.clone();
+                match create_silero_vad(&silero_path, &next_cfg) {
+                    Ok(v) => {
+                        silero_vad = Some(v);
+                        applied_silero_cfg = Some(next_cfg.clone());
+                        if utterance_had_interim {
+                            utterance_id += 1;
+                            utterance_had_interim = false;
+                        }
+                        silero_active_buf.clear();
+                        speech_started = false;
+                        last_interim_text.clear();
+                        has_new_speech_since_interim = false;
+                        pause_started_at = None;
+                        quiet_start = None;
+                        energy_vad.reset();
+                    }
+                    Err(err) => {
+                        on_event(AsrEvent::Error(err.to_string()));
+                        if silero_vad.is_none() {
+                            next_cfg.vad_mode = VadMode::Energy;
+                        }
+                    }
                 }
             } else {
                 silero_vad = None;
+                applied_silero_cfg = None;
+                if utterance_had_interim {
+                    utterance_id += 1;
+                    utterance_had_interim = false;
+                }
+                silero_active_buf.clear();
+                speech_started = false;
+                last_interim_text.clear();
+                has_new_speech_since_interim = false;
+                pause_started_at = None;
+                quiet_start = None;
+                energy_vad.reset();
             }
-            silero_active_buf.clear();
-            speech_started = false;
-            last_interim_text.clear();
-            has_new_speech_since_interim = false;
-            pause_started_at = None;
+        } else if silero_vad.is_none() && next_cfg.vad_mode == VadMode::Silero {
+            // Silero failed to load earlier and user has not changed mode/params; stay on Energy fallback.
+            next_cfg.vad_mode = VadMode::Energy;
         }
-        energy_vad.update_params(&latest);
-        active_cfg = latest;
+        energy_vad.update_params(&next_cfg);
+        active_cfg = next_cfg;
 
         chunk_buf.extend_from_slice(&samples);
 
@@ -892,6 +945,7 @@ fn asr_worker_loop(
                     while !vad.is_empty() {
                         if let Some(segment) = vad.front() {
                             vad.pop();
+                            let mut emitted_this_seg = false;
                             let samples = segment.samples();
                             if energy_gate <= 0.0 || foreground_rms(samples) >= energy_gate {
                                 let (maybe_text, asr_ms) = decode_samples(&recognizer, samples);
@@ -901,9 +955,13 @@ fn asr_worker_loop(
                                         text,
                                         asr_ms,
                                     });
-                                    utterance_id += 1;
+                                    emitted_this_seg = true;
                                     emitted_final = true;
                                 }
+                            }
+                            if emitted_this_seg || utterance_had_interim {
+                                utterance_id += 1;
+                                utterance_had_interim = false;
                             }
                         }
                         silero_active_buf.clear();
@@ -931,13 +989,14 @@ fn asr_worker_loop(
                             || foreground_rms(&silero_active_buf) >= energy_gate)
                     {
                         has_new_speech_since_interim = false;
-                        last_interim_at = Instant::now();
                         let (maybe_text, asr_ms) = decode_samples(&recognizer, &silero_active_buf);
+                        last_interim_at = Instant::now();
                         if let Some(text) = maybe_text {
                             if normalize_transcript_key(&text)
                                 != normalize_transcript_key(&last_interim_text)
                             {
                                 last_interim_text = text.clone();
+                                utterance_had_interim = true;
                                 on_event(AsrEvent::Interim {
                                     utterance_id,
                                     text,
@@ -954,13 +1013,18 @@ fn asr_worker_loop(
 
                     if let Some(seg) = maybe_seg {
                         let (maybe_text, asr_ms) = decode_samples(&recognizer, &seg);
+                        let mut emitted_this_seg = false;
                         if let Some(text) = maybe_text {
                             on_event(AsrEvent::Final {
                                 utterance_id,
                                 text,
                                 asr_ms,
                             });
+                            emitted_this_seg = true;
+                        }
+                        if emitted_this_seg || utterance_had_interim {
                             utterance_id += 1;
+                            utterance_had_interim = false;
                         }
                         last_interim_text.clear();
                     } else if energy_vad.in_speech()
@@ -971,14 +1035,15 @@ fn asr_worker_loop(
                             >= ((active_cfg.min_speech_sec.min(0.25)) * SAMPLE_RATE as f32)
                                 as usize
                     {
-                        last_interim_at = Instant::now();
                         let (maybe_text, asr_ms) =
                             decode_samples(&recognizer, energy_vad.active_samples());
+                        last_interim_at = Instant::now();
                         if let Some(text) = maybe_text {
                             if normalize_transcript_key(&text)
                                 != normalize_transcript_key(&last_interim_text)
                             {
                                 last_interim_text = text.clone();
+                                utterance_had_interim = true;
                                 on_event(AsrEvent::Interim {
                                     utterance_id,
                                     text,
@@ -992,31 +1057,39 @@ fn asr_worker_loop(
         }
     }
 
-    // Flush any remaining active audio when stopping capture
-    if let Some(ref vad) = silero_vad {
-        vad.flush();
-        while !vad.is_empty() {
-            if let Some(segment) = vad.front() {
-                vad.pop();
-                let (maybe_text, asr_ms) = decode_samples(&recognizer, segment.samples());
+    // Flush trailing audio only when input stream terminated unexpectedly (not on explicit stop).
+    if !stop_flag.load(Ordering::Relaxed) {
+        let energy_gate = (active_cfg.energy_threshold_pct / 100.0).clamp(0.0, 0.60);
+        if let Some(ref vad) = silero_vad {
+            vad.flush();
+            while !vad.is_empty() {
+                if let Some(segment) = vad.front() {
+                    vad.pop();
+                    let samples = segment.samples();
+                    if energy_gate <= 0.0 || foreground_rms(samples) >= energy_gate {
+                        let (maybe_text, asr_ms) = decode_samples(&recognizer, samples);
+                        if let Some(text) = maybe_text {
+                            on_event(AsrEvent::Final {
+                                utterance_id,
+                                text,
+                                asr_ms,
+                            });
+                            utterance_id += 1;
+                        }
+                    }
+                }
+            }
+        } else if let Some(seg) = energy_vad.flush() {
+            if energy_gate <= 0.0 || foreground_rms(&seg) >= energy_gate {
+                let (maybe_text, asr_ms) = decode_samples(&recognizer, &seg);
                 if let Some(text) = maybe_text {
                     on_event(AsrEvent::Final {
                         utterance_id,
                         text,
                         asr_ms,
                     });
-                    utterance_id += 1;
                 }
             }
-        }
-    } else if let Some(seg) = energy_vad.flush() {
-        let (maybe_text, asr_ms) = decode_samples(&recognizer, &seg);
-        if let Some(text) = maybe_text {
-            on_event(AsrEvent::Final {
-                utterance_id,
-                text,
-                asr_ms,
-            });
         }
     }
     vad_prob_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
@@ -1100,6 +1173,44 @@ mod tests {
         let seg = finalized.expect("EnergyVad should emit speech segment after silence");
         assert!(seg.len() >= 1600);
         assert!(!vad.in_speech());
+    }
+
+    #[test]
+    fn energy_vad_trims_trailing_silence() {
+        let mut cfg = AudioVadConfig::default();
+        cfg.energy_threshold_pct = 5.0;
+        cfg.min_speech_sec = 0.20;
+        cfg.silence_dur_sec = 0.50; // 8000 samples (~16 chunks)
+        cfg.max_speech_sec = 5.0;
+        cfg.silence_mode = SilenceMode::Fixed;
+
+        let mut vad = EnergyVad::new(&cfg);
+        let loud = vec![0.2f32; WINDOW_SAMPLES];
+        let silent = vec![0.0f32; WINDOW_SAMPLES];
+
+        // 10 voiced chunks = 5120 samples
+        for _ in 0..10 {
+            let (_, seg) = vad.feed_chunk(&loud);
+            assert!(seg.is_none());
+        }
+        // Feed silence until emission (16 chunks = 8192 silence samples)
+        let mut finalized = None;
+        let mut silence_chunks = 0usize;
+        for _ in 0..20 {
+            silence_chunks += 1;
+            let (_, seg) = vad.feed_chunk(&silent);
+            if seg.is_some() {
+                finalized = seg;
+                break;
+            }
+        }
+        let seg = finalized.expect("EnergyVad should emit speech");
+        let untrimmed = (10 + silence_chunks) * WINDOW_SAMPLES;
+        assert!(
+            seg.len() < untrimmed,
+            "expected trailing silence trimmed (got {}, untrimmed {untrimmed})",
+            seg.len()
+        );
     }
 
     #[test]

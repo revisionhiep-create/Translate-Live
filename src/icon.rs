@@ -127,8 +127,11 @@ pub fn rgba_to_hicon(rgba: &[u8], w: u32, h: u32) -> windows::core::Result<HICON
 
         let hdc = GetDC(None);
         let mut bits_ptr: *mut core::ffi::c_void = null_mut();
-        let hbm_color = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0)?;
-        let _ = ReleaseDC(None, hdc);
+        let hbm_res = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0);
+        if !hdc.is_invalid() {
+            let _ = ReleaseDC(None, hdc);
+        }
+        let hbm_color = hbm_res?;
 
         if hbm_color.is_invalid() || bits_ptr.is_null() {
             if !hbm_color.is_invalid() {

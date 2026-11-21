@@ -211,7 +211,7 @@ impl TranslationCoordinator {
 
                 loop {
                     let mut req = {
-                        let mut guard = lock.lock().unwrap();
+                        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
                             if guard.stop {
                                 return;
@@ -222,7 +222,7 @@ impl TranslationCoordinator {
                             if let Some(i) = guard.latest_interim.take() {
                                 break i;
                             }
-                            guard = cvar.wait(guard).unwrap();
+                            guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
                         }
                     };
 
@@ -303,7 +303,7 @@ impl TranslationCoordinator {
 
     pub fn submit(&self, req: TranslateRequest) {
         let (lock, cvar) = &*self.queue;
-        let mut guard = lock.lock().unwrap();
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         if guard.stop {
             return;
         }
@@ -319,7 +319,7 @@ impl TranslationCoordinator {
     pub fn stop(&mut self) {
         let (lock, cvar) = &*self.queue;
         {
-            let mut guard = lock.lock().unwrap();
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
             guard.stop = true;
             guard.finals.clear();
             guard.latest_interim = None;
@@ -392,139 +392,161 @@ fn worker_loop(rx: mpsc::Receiver<LlmCmd>) {
             }
         };
 
-        let (model, backend_desc) = match load_model_only(&backend, &path, backend_pref) {
-            Ok(res) => res,
-            Err(err) => {
-                let _ = reply.send(Err(err));
-                continue;
+        let res = if backend_pref == ComputeBackend::VulkanGpu {
+            match load_and_serve_model(
+                &backend,
+                &path,
+                ComputeBackend::VulkanGpu,
+                &rx,
+                &reply,
+                &mut rolling_history,
+                &mut pending_load,
+            ) {
+                Ok(should_exit) => Ok(should_exit),
+                Err(_gpu_err) => load_and_serve_model(
+                    &backend,
+                    &path,
+                    ComputeBackend::CpuOnly,
+                    &rx,
+                    &reply,
+                    &mut rolling_history,
+                    &mut pending_load,
+                ),
             }
+        } else {
+            load_and_serve_model(
+                &backend,
+                &path,
+                ComputeBackend::CpuOnly,
+                &rx,
+                &reply,
+                &mut rolling_history,
+                &mut pending_load,
+            )
         };
 
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get().min(8) as i32)
-            .unwrap_or(4);
-
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(N_CTX))
-            .with_n_batch(N_BATCH as u32)
-            .with_n_threads(num_threads)
-            .with_n_threads_batch(num_threads);
-
-        let mut ctx = match model
-            .new_context(&backend, ctx_params)
-            .context("Failed to create llama inference context")
-        {
-            Ok(c) => c,
+        match res {
+            Ok(true) => break,
+            Ok(false) => {}
             Err(err) => {
                 let _ = reply.send(Err(err));
-                continue;
             }
-        };
-
-        let style = detect_prompt_style(&model, &path);
-
-        if style == PromptStyle::QwenNoThink {
-            let special_check = model.vocab().tokenize(b"<|im_start|>", false, true);
-            if special_check.len() != 1 {
-                drop(ctx);
-                drop(model);
-                let _ = reply.send(Err(anyhow!(
-                    "Expected <|im_start|> to tokenize as 1 special token, got {}",
-                    special_check.len()
-                )));
-                continue;
-            }
-        }
-
-        if let Err(err) = warmup_context(&model, &mut ctx, style) {
-            drop(ctx);
-            drop(model);
-            let _ = reply.send(Err(err));
-            continue;
-        }
-
-        let model_name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("model.gguf")
-            .to_string();
-
-        rolling_history.clear();
-        let _ = reply.send(Ok(LoadInfo {
-            backend_desc,
-            model_name,
-        }));
-
-        let mut should_exit = false;
-        loop {
-            match rx.recv() {
-                Ok(LlmCmd::Translate {
-                    req,
-                    on_partial,
-                    reply,
-                }) => {
-                    let res = run_translate(
-                        &model,
-                        &mut ctx,
-                        style,
-                        &rolling_history,
-                        &req,
-                        on_partial.as_deref(),
-                    );
-                    if let Ok(ref out) = res {
-                        if req.is_final && !out.translation.trim().is_empty() {
-                            push_rolling_pair(
-                                &mut rolling_history,
-                                req.text,
-                                out.translation.clone(),
-                                req.context_pairs,
-                            );
-                        }
-                    }
-                    let _ = reply.send(res);
-                }
-                Ok(LlmCmd::RecordContext {
-                    src,
-                    tl,
-                    context_pairs,
-                }) => {
-                    if !tl.trim().is_empty() {
-                        push_rolling_pair(&mut rolling_history, src, tl, context_pairs);
-                    }
-                }
-                Ok(LlmCmd::ClearContext) => {
-                    rolling_history.clear();
-                }
-                Ok(LlmCmd::Unload { reply }) => {
-                    drop(ctx);
-                    drop(model);
-                    rolling_history.clear();
-                    let _ = reply.send(());
-                    break;
-                }
-                Ok(LlmCmd::Load {
-                    path: next_path,
-                    backend_pref: next_pref,
-                    reply: next_reply,
-                }) => {
-                    drop(ctx);
-                    drop(model);
-                    rolling_history.clear();
-                    pending_load = Some((next_path, next_pref, next_reply));
-                    break;
-                }
-                Ok(LlmCmd::Shutdown) | Err(_) => {
-                    drop(ctx);
-                    drop(model);
-                    should_exit = true;
-                    break;
-                }
-            }
-        }
-        if should_exit {
-            break;
         }
     }
+}
+
+fn load_and_serve_model(
+    backend: &LlamaBackend,
+    path: &Path,
+    backend_pref: ComputeBackend,
+    rx: &mpsc::Receiver<LlmCmd>,
+    reply: &Sender<Result<LoadInfo>>,
+    rolling_history: &mut VecDeque<(String, String)>,
+    pending_load: &mut Option<(PathBuf, ComputeBackend, Sender<Result<LoadInfo>>)>,
+) -> Result<bool> {
+    let (model, backend_desc) = load_model_only(backend, path, backend_pref)?;
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(8) as i32)
+        .unwrap_or(4);
+
+    let ctx_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(N_CTX))
+        .with_n_batch(N_BATCH as u32)
+        .with_n_threads(num_threads)
+        .with_n_threads_batch(num_threads);
+
+    let mut ctx = model
+        .new_context(backend, ctx_params)
+        .context("Failed to create llama inference context")?;
+
+    let style = detect_prompt_style(&model, path);
+
+    if style == PromptStyle::QwenNoThink {
+        let special_check = model.vocab().tokenize(b"<|im_start|>", false, true);
+        if special_check.len() != 1 {
+            bail!(
+                "Expected <|im_start|> to tokenize as 1 special token, got {}",
+                special_check.len()
+            );
+        }
+    }
+
+    warmup_context(&model, &mut ctx, style)?;
+
+    let model_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model.gguf")
+        .to_string();
+
+    rolling_history.clear();
+    let _ = reply.send(Ok(LoadInfo {
+        backend_desc,
+        model_name,
+    }));
+
+    let mut should_exit = false;
+    loop {
+        match rx.recv() {
+            Ok(LlmCmd::Translate {
+                req,
+                on_partial,
+                reply,
+            }) => {
+                let res = run_translate(
+                    &model,
+                    &mut ctx,
+                    style,
+                    rolling_history,
+                    &req,
+                    on_partial.as_deref(),
+                );
+                if let Ok(ref out) = res {
+                    if req.is_final && !out.translation.trim().is_empty() {
+                        push_rolling_pair(
+                            rolling_history,
+                            req.text,
+                            out.translation.clone(),
+                            req.context_pairs,
+                        );
+                    }
+                }
+                let _ = reply.send(res);
+            }
+            Ok(LlmCmd::RecordContext {
+                src,
+                tl,
+                context_pairs,
+            }) => {
+                if !tl.trim().is_empty() {
+                    push_rolling_pair(rolling_history, src, tl, context_pairs);
+                }
+            }
+            Ok(LlmCmd::ClearContext) => {
+                rolling_history.clear();
+            }
+            Ok(LlmCmd::Unload { reply }) => {
+                rolling_history.clear();
+                let _ = reply.send(());
+                break;
+            }
+            Ok(LlmCmd::Load {
+                path: next_path,
+                backend_pref: next_pref,
+                reply: next_reply,
+            }) => {
+                rolling_history.clear();
+                *pending_load = Some((next_path, next_pref, next_reply));
+                break;
+            }
+            Ok(LlmCmd::Shutdown) | Err(_) => {
+                should_exit = true;
+                break;
+            }
+        }
+    }
+    Ok(should_exit)
 }
 
 pub fn normalize_dedup_key(s: &str) -> String {
@@ -570,23 +592,26 @@ fn load_model_only(
         bail!("Model file does not exist: {}", path.display());
     }
 
-    if pref == ComputeBackend::VulkanGpu {
-        if let Ok(m) = LlamaModel::load_from_file(
-            backend,
-            path,
-            &LlamaModelParams::default().with_n_gpu_layers(u32::MAX),
-        ) {
-            return Ok((m, "Vulkan GPU".to_string()));
+    match pref {
+        ComputeBackend::VulkanGpu => {
+            let m = LlamaModel::load_from_file(
+                backend,
+                path,
+                &LlamaModelParams::default().with_n_gpu_layers(u32::MAX),
+            )
+            .with_context(|| format!("Failed to load Vulkan GPU model from {}", path.display()))?;
+            Ok((m, "Vulkan GPU".to_string()))
+        }
+        ComputeBackend::CpuOnly => {
+            let m = LlamaModel::load_from_file(
+                backend,
+                path,
+                &LlamaModelParams::default().with_n_gpu_layers(0),
+            )
+            .with_context(|| format!("Failed to load CPU model from {}", path.display()))?;
+            Ok((m, "CPU".to_string()))
         }
     }
-
-    let m = LlamaModel::load_from_file(
-        backend,
-        path,
-        &LlamaModelParams::default().with_n_gpu_layers(0),
-    )
-    .with_context(|| format!("Failed to load model from {}", path.display()))?;
-    Ok((m, "CPU".to_string()))
 }
 
 fn detect_prompt_style(model: &LlamaModel, path: &Path) -> PromptStyle {
@@ -841,16 +866,25 @@ fn dedup_consecutive_clauses(text: &str) -> String {
     let mut i = 0usize;
     let mut start = 0usize;
     while i < chars.len() {
-        if matches!(
-            chars[i],
-            '.' | '!' | '?' | '。' | '！' | '？' | ';' | '…'
-        ) {
+        let is_embedded_dot =
+            chars[i] == '.' && chars.get(i + 1).is_some_and(|c| c.is_alphanumeric());
+        if !is_embedded_dot
+            && matches!(
+                chars[i],
+                '.' | '!' | '?' | '。' | '！' | '？' | ';' | '…'
+            )
+        {
             while i + 1 < chars.len()
                 && matches!(
                     chars[i + 1],
                     '.' | '!' | '?' | '。' | '！' | '？' | ';' | '…'
                 )
             {
+                let next_embedded_dot = chars[i + 1] == '.'
+                    && chars.get(i + 2).is_some_and(|c| c.is_alphanumeric());
+                if next_embedded_dot {
+                    break;
+                }
                 i += 1;
             }
             let seg: String = chars[start..=i].iter().collect();
@@ -1051,9 +1085,21 @@ fn has_runaway_repetition(visible: &str) -> bool {
     false
 }
 
+fn utf8_streaming_slice(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => std::borrow::Cow::Borrowed(s),
+        Err(e) if e.error_len().is_none() => std::borrow::Cow::Borrowed(
+            std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or(""),
+        ),
+        Err(_) => String::from_utf8_lossy(bytes),
+    }
+}
+
 pub fn clean_translation_output(raw: &str) -> String {
     let mut s = if let Some(idx) = raw.rfind("</think>") {
         &raw[idx + "</think>".len()..]
+    } else if let Some(idx) = raw.find("<think>") {
+        &raw[..idx]
     } else {
         raw
     };
@@ -1166,21 +1212,20 @@ fn run_translate_inner(
         if vocab.is_eog(token) {
             break;
         }
-        sampler.accept(token);
         generated_tokens += 1;
         vocab.token_to_piece_into(token, &mut output_bytes, false, None);
 
-        let lossy = String::from_utf8_lossy(&output_bytes);
-        if lossy.ends_with("<|im_end|>") || lossy.ends_with("<|endoftext|>") {
+        let visible_utf8 = utf8_streaming_slice(&output_bytes);
+        if visible_utf8.ends_with("<|im_end|>") || visible_utf8.ends_with("<|endoftext|>") {
             break;
         }
 
-        let in_think = lossy.contains("<think>") && !lossy.contains("</think>");
+        let in_think = visible_utf8.contains("<think>") && !visible_utf8.contains("</think>");
         if !in_think {
-            let visible = if let Some(idx) = lossy.rfind("</think>") {
-                &lossy[idx + "</think>".len()..]
+            let visible = if let Some(idx) = visible_utf8.rfind("</think>") {
+                &visible_utf8[idx + "</think>".len()..]
             } else {
-                &lossy
+                visible_utf8.as_ref()
             };
             let full_visible = match prefill {
                 Some(p) => format!("{p}{visible}"),
@@ -1304,6 +1349,15 @@ mod tests {
         assert_eq!(
             clean_translation_output(raw),
             "What the hell are you doing?"
+        );
+        assert_eq!(clean_translation_output("<think>\ntruncated reasoning"), "");
+        assert_eq!(
+            clean_translation_output("It's 1.5 seconds in v3.5 on twitch.tv!"),
+            "It's 1.5 seconds in v3.5 on twitch.tv!"
+        );
+        assert_eq!(
+            clean_translation_output("Check U.S.A. news. Check U.S.A. news."),
+            "Check U.S.A. news."
         );
     }
 

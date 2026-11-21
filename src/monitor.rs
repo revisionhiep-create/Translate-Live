@@ -1,11 +1,13 @@
 use crate::config::WindowState;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowPlacement, GetWindowRect, IsIconic, IsZoomed, SetWindowPos, ShowWindow,
-    MONITORINFOF_PRIMARY, SWP_NOACTIVATE, SWP_NOZORDER, SW_MAXIMIZE, SW_RESTORE, WINDOWPLACEMENT,
+    GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, IsIconic, IsZoomed, SetWindowPos,
+    ShowWindow, GWL_EXSTYLE, MONITORINFOF_PRIMARY, SWP_NOACTIVATE, SWP_NOZORDER, SW_MAXIMIZE,
+    SW_RESTORE, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
 
 pub const MIN_VISIBLE_W: i32 = 80;
@@ -79,32 +81,36 @@ pub fn enumerate_monitors() -> Vec<MonitorWorkArea> {
 }
 
 fn overlap_dims(
-    ax0: i32,
-    ay0: i32,
-    ax1: i32,
-    ay1: i32,
+    ax0: i64,
+    ay0: i64,
+    ax1: i64,
+    ay1: i64,
     m: &MonitorWorkArea,
-) -> (i32, i32) {
-    let ow = (ax1.min(m.right) - ax0.max(m.left)).max(0);
-    let oh = (ay1.min(m.bottom) - ay0.max(m.top)).max(0);
+) -> (i64, i64) {
+    let ow = (ax1.min(m.right as i64) - ax0.max(m.left as i64)).max(0);
+    let oh = (ay1.min(m.bottom as i64) - ay0.max(m.top as i64)).max(0);
     (ow, oh)
 }
 
-fn dist_sq_to_monitor(cx: i32, cy: i32, m: &MonitorWorkArea) -> i64 {
-    let dx = if cx < m.left {
-        (m.left - cx) as i64
-    } else if cx > m.right {
-        (cx - m.right) as i64
+fn dist_sq_to_monitor(cx: i64, cy: i64, m: &MonitorWorkArea) -> i128 {
+    let left = m.left as i64;
+    let right = m.right as i64;
+    let top = m.top as i64;
+    let bottom = m.bottom as i64;
+    let dx = if cx < left {
+        left - cx
+    } else if cx > right {
+        cx - right
     } else {
         0
-    };
-    let dy = if cy < m.top {
-        (m.top - cy) as i64
-    } else if cy > m.bottom {
-        (cy - m.bottom) as i64
+    } as i128;
+    let dy = if cy < top {
+        top - cy
+    } else if cy > bottom {
+        cy - bottom
     } else {
         0
-    };
+    } as i128;
     dx * dx + dy * dy
 }
 
@@ -202,14 +208,30 @@ pub fn sanitize_window_rect(
         );
     };
 
-    let raw_w = (ws.width.round() as i32).max(min_w);
-    let raw_h = (ws.height.round() as i32).max(min_h);
+    if !ws.width.is_finite() || !ws.height.is_finite() {
+        return place_fallback_on_monitor(
+            default_w,
+            default_h,
+            min_w,
+            min_h,
+            &primary,
+            fallback,
+            ws.maximized,
+        );
+    }
 
-    let mut best_mon: Option<(i64, MonitorWorkArea)> = None;
+    let raw_w = (ws.width.round() as f64).clamp(min_w as f64, i32::MAX as f64) as i32;
+    let raw_h = (ws.height.round() as f64).clamp(min_h as f64, i32::MAX as f64) as i32;
+    let ws_x = ws.x as i64;
+    let ws_y = ws.y as i64;
+    let ws_x1 = ws_x + (raw_w as i64);
+    let ws_y1 = ws_y + (raw_h as i64);
+
+    let mut best_mon: Option<(i128, MonitorWorkArea)> = None;
     for &m in monitors {
-        let (ow, oh) = overlap_dims(ws.x, ws.y, ws.x + raw_w, ws.y + raw_h, &m);
-        if ow >= MIN_VISIBLE_W && oh >= MIN_VISIBLE_H {
-            let area = (ow as i64) * (oh as i64);
+        let (ow, oh) = overlap_dims(ws_x, ws_y, ws_x1, ws_y1, &m);
+        if ow >= MIN_VISIBLE_W as i64 && oh >= MIN_VISIBLE_H as i64 {
+            let area = (ow as i128) * (oh as i128);
             if best_mon.as_ref().map_or(true, |(best_a, _)| area > *best_a) {
                 best_mon = Some((area, m));
             }
@@ -218,13 +240,13 @@ pub fn sanitize_window_rect(
 
     if let Some((_, m)) = best_mon {
         let (cw, ch) = clamp_dims_to_monitor(raw_w, raw_h, min_w, min_h, &m);
-        let (ow, oh) = overlap_dims(ws.x, ws.y, ws.x + cw, ws.y + ch, &m);
-        let (tx, ty) = if ow >= MIN_VISIBLE_W && oh >= MIN_VISIBLE_H && ws.y >= m.top {
+        let (ow, oh) = overlap_dims(ws_x, ws_y, ws_x + (cw as i64), ws_y + (ch as i64), &m);
+        let (tx, ty) = if ow >= MIN_VISIBLE_W as i64 && oh >= MIN_VISIBLE_H as i64 && ws.y >= m.top {
             (ws.x, ws.y)
         } else {
-            let min_x = m.left - cw + MIN_VISIBLE_W.min(cw);
-            let max_x = m.right - MIN_VISIBLE_W.min(cw);
-            let max_y = (m.bottom - MIN_VISIBLE_H.min(ch)).max(m.top);
+            let min_x = m.left.saturating_sub(cw).saturating_add(MIN_VISIBLE_W.min(cw));
+            let max_x = m.right.saturating_sub(MIN_VISIBLE_W.min(cw));
+            let max_y = m.bottom.saturating_sub(MIN_VISIBLE_H.min(ch)).max(m.top);
             (
                 ws.x.clamp(min_x, max_x.max(min_x)),
                 ws.y.clamp(m.top, max_y),
@@ -245,8 +267,8 @@ pub fn sanitize_window_rect(
             place_fallback_on_monitor(raw_w, raw_h, min_w, min_h, &primary, fallback, false)
         }
         FallbackPlacement::CenterPrimary => {
-            let cx = ws.x.saturating_add(raw_w / 2);
-            let cy = ws.y.saturating_add(raw_h / 2);
+            let cx = ws_x + (raw_w as i64) / 2;
+            let cy = ws_y + (raw_h as i64) / 2;
             let nearest = monitors
                 .iter()
                 .min_by_key(|m| dist_sq_to_monitor(cx, cy, m))
@@ -254,7 +276,7 @@ pub fn sanitize_window_rect(
                 .unwrap_or(primary);
             let (cw, ch) = clamp_dims_to_monitor(raw_w, raw_h, min_w, min_h, &nearest);
             let dist_sq = dist_sq_to_monitor(cx, cy, &nearest);
-            let threshold = (nearest.width().max(nearest.height()) as i64).pow(2);
+            let threshold = (nearest.width().max(nearest.height()) as i128).pow(2);
             if dist_sq > threshold {
                 place_fallback_on_monitor(
                     cw,
@@ -298,7 +320,7 @@ pub fn apply_window_rect(hwnd_raw: isize, rect: ResolvedWindowRect) {
     }
     let hwnd = HWND(hwnd_raw as *mut _);
     unsafe {
-        if IsZoomed(hwnd).as_bool() && !rect.maximized {
+        if IsZoomed(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
         let _ = SetWindowPos(
@@ -317,7 +339,8 @@ pub fn apply_window_rect(hwnd_raw: isize, rect: ResolvedWindowRect) {
 }
 
 /// Queries the window's persistent geometry in physical virtual-screen coordinates.
-/// Uses `rcNormalPosition` when maximized so restored size/monitor survives restarts.
+/// Uses `rcNormalPosition` when maximized (converted from workspace coords when applicable)
+/// so restored size/monitor survives restarts.
 pub fn query_window_state(hwnd_raw: isize) -> Option<WindowState> {
     if hwnd_raw == 0 {
         return None;
@@ -334,12 +357,30 @@ pub fn query_window_state(hwnd_raw: isize) -> Option<WindowState> {
                 ..Default::default()
             };
             if GetWindowPlacement(hwnd, &mut wp).is_ok() {
+                let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+                let (dx, dy) = if (ex_style & WS_EX_TOOLWINDOW.0) == 0 {
+                    let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    let mut mi = MONITORINFO {
+                        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    if !hmon.is_invalid() && GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                        (
+                            mi.rcWork.left - mi.rcMonitor.left,
+                            mi.rcWork.top - mi.rcMonitor.top,
+                        )
+                    } else {
+                        (0, 0)
+                    }
+                } else {
+                    (0, 0)
+                };
                 let r = wp.rcNormalPosition;
                 let w = (r.right - r.left).max(100) as f32;
                 let h = (r.bottom - r.top).max(60) as f32;
                 return Some(WindowState {
-                    x: r.left,
-                    y: r.top,
+                    x: r.left.saturating_add(dx),
+                    y: r.top.saturating_add(dy),
                     width: w,
                     height: h,
                     maximized: true,
@@ -526,5 +567,47 @@ mod tests {
         );
         assert_eq!(r.x, (2560 - 820) / 2);
         assert_eq!(r.y, 1400 - 150 - 48);
+    }
+
+    #[test]
+    fn sanitize_window_rect_handles_extreme_coords_and_nan_without_overflow() {
+        let mons = multi_monitors();
+        for extreme in [
+            WindowState {
+                x: i32::MAX,
+                y: i32::MAX,
+                width: 1e20,
+                height: 1e20,
+                maximized: false,
+            },
+            WindowState {
+                x: i32::MIN,
+                y: i32::MIN,
+                width: 560.0,
+                height: 760.0,
+                maximized: false,
+            },
+            WindowState {
+                x: 100,
+                y: 100,
+                width: f32::NAN,
+                height: f32::INFINITY,
+                maximized: false,
+            },
+        ] {
+            let r = sanitize_window_rect(
+                Some(extreme),
+                560,
+                760,
+                480,
+                560,
+                &mons,
+                FallbackPlacement::CenterPrimary,
+            );
+            assert!(r.width >= 480 && r.width <= 2560);
+            assert!(r.height >= 560 && r.height <= 1400);
+            assert!(r.x >= 0 && r.x + r.width <= 2560);
+            assert!(r.y >= 0 && r.y + r.height <= 1400);
+        }
     }
 }
