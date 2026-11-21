@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_ASR_URL: &str =
     "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8";
 pub const DEFAULT_LLM_URL: &str =
-    "https://huggingface.co/HauhauCS/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive/resolve/main/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf";
+    "https://huggingface.co/tencent/HY-MT1.5-7B-GGUF/resolve/main/HY-MT1.5-7B-Q4_K_M.gguf";
 pub const SILERO_VAD_URL: &str =
     "https://huggingface.co/csukuangfj/vad/resolve/main/silero_vad.onnx";
 
@@ -141,14 +141,34 @@ pub struct LlmPreset {
 
 pub const LLM_PRESETS: &[LlmPreset] = &[
     LlmPreset {
-        name: "Qwen3.5-4B Uncensored Q4_K_M (Default)",
+        name: "HY-MT1.5-7B Q4_K_M (Default)",
         url: DEFAULT_LLM_URL,
-        subtitle: "Best translation quality & uncensored slang (~2.52 GB)",
+        subtitle: "Best dedicated multilingual translator · 33+ langs (~4.31 GB)",
     },
     LlmPreset {
-        name: "Qwen2.5-3B Instruct Q4_K_M (Light)",
-        url: "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
-        subtitle: "Smaller & faster fallback (~1.93 GB)",
+        name: "Qwen3.5-9B Uncensored Q4_K_M",
+        url: "https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive/resolve/main/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf",
+        subtitle: "Best uncensored slang, gaming & rolling context (~5.24 GB)",
+    },
+    LlmPreset {
+        name: "Shisa v2.1 Qwen3-8B Q4_K_M (JA ↔ EN)",
+        url: "https://huggingface.co/mradermacher/shisa-v2.1-qwen3-8b-GGUF/resolve/main/shisa-v2.1-qwen3-8b.Q4_K_M.gguf",
+        subtitle: "Natural colloquial Japanese ↔ English dialogue (~4.68 GB)",
+    },
+    LlmPreset {
+        name: "TranslateGemma 12B Q4_K_M",
+        url: "https://huggingface.co/mradermacher/translategemma-12b-it-GGUF/resolve/main/translategemma-12b-it.Q4_K_M.gguf",
+        subtitle: "Google Gemma 3 dedicated 55-language MT (~6.80 GB)",
+    },
+    LlmPreset {
+        name: "Qwen3.5-4B Uncensored Q4_K_M (Fast)",
+        url: "https://huggingface.co/HauhauCS/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive/resolve/main/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf",
+        subtitle: "Fast low-VRAM uncensored translation (~2.52 GB)",
+    },
+    LlmPreset {
+        name: "HY-MT1.5-1.8B Q8_0 (Ultra-Fast / CPU)",
+        url: "https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/resolve/main/HY-MT1.5-1.8B-Q8_0.gguf",
+        subtitle: "Smallest dedicated MT for low VRAM or CPU (~1.78 GB)",
     },
 ];
 
@@ -334,6 +354,34 @@ impl Default for AudioVadConfig {
     }
 }
 
+impl AudioVadConfig {
+    pub fn apply_general_video_profile(&mut self) {
+        self.vad_mode = VadMode::Silero;
+        self.silero_threshold_pct = 42.0;
+        self.energy_threshold_pct = 1.5;
+        self.min_speech_sec = 0.25;
+        self.max_speech_sec = 8.0;
+        self.silence_mode = SilenceMode::Adaptive;
+        self.silence_dur_sec = 0.85;
+        self.context_pairs = 6;
+        self.incremental_asr = true;
+        self.interim_interval_sec = 0.65;
+    }
+
+    pub fn apply_gaming_stream_profile(&mut self) {
+        self.vad_mode = VadMode::Silero;
+        self.silero_threshold_pct = 62.0;
+        self.energy_threshold_pct = 2.5;
+        self.min_speech_sec = 0.30;
+        self.max_speech_sec = 6.5;
+        self.silence_mode = SilenceMode::Adaptive;
+        self.silence_dur_sec = 0.70;
+        self.context_pairs = 4;
+        self.incremental_asr = true;
+        self.interim_interval_sec = 0.65;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubtitleLineSource {
     Original,
@@ -479,7 +527,7 @@ impl Default for OverlayConfig {
             live_style: LiveSubtitleStyle::PrefixLockedFill,
             max_lines: 3,
             smooth_scroll: true,
-            min_display_sec: 1.20,
+            min_display_sec: 0.75,
             visible: true,
             click_through: false,
             top_most: true,
@@ -593,6 +641,22 @@ pub fn language_prompt_name(code: &str) -> &'static str {
         "vi" => "Vietnamese",
         "pt" => "Portuguese",
         _ => "the source language",
+    }
+}
+
+pub fn language_chinese_name(code: &str) -> &'static str {
+    match code {
+        "ja" => "日语",
+        "ko" => "韩语",
+        "zh" => "中文",
+        "yue" => "粤语",
+        "en" => "英语",
+        "es" => "西班牙语",
+        "fr" => "法语",
+        "de" => "德语",
+        "vi" => "越南语",
+        "pt" => "葡萄牙语",
+        _ => "英语",
     }
 }
 
@@ -1101,7 +1165,7 @@ mod tests {
         assert_eq!(ov.live_style, LiveSubtitleStyle::PrefixLockedFill);
         assert_eq!(ov.max_lines, 3);
         assert!(ov.smooth_scroll);
-        assert_eq!(ov.min_display_sec, 1.20);
+        assert_eq!(ov.min_display_sec, 0.75);
 
         let legacy_json = r#"{
             "overlay": {
@@ -1114,5 +1178,63 @@ mod tests {
         assert_eq!(parsed.overlay.max_lines, 3);
         assert!(parsed.overlay.smooth_scroll);
         assert_eq!(parsed.overlay.min_display_sec, 1.2);
+    }
+
+    #[test]
+    fn audio_vad_profiles_update_thresholds_while_preserving_identity() {
+        let mut cfg = AudioVadConfig::default();
+        cfg.loopback_device_id = Some("dev-out".to_string());
+        cfg.mic_device_id = Some("dev-in".to_string());
+        cfg.source_lang = "ko".to_string();
+        cfg.target_lang = "vi".to_string();
+        cfg.compute_backend = ComputeBackend::CpuOnly;
+
+        cfg.apply_general_video_profile();
+        assert_eq!(cfg.vad_mode, VadMode::Silero);
+        assert_eq!(cfg.silero_threshold_pct, 42.0);
+        assert_eq!(cfg.energy_threshold_pct, 1.5);
+        assert_eq!(cfg.min_speech_sec, 0.25);
+        assert_eq!(cfg.max_speech_sec, 8.0);
+        assert_eq!(cfg.silence_dur_sec, 0.85);
+        assert_eq!(cfg.context_pairs, 6);
+        assert_eq!(cfg.loopback_device_id.as_deref(), Some("dev-out"));
+        assert_eq!(cfg.source_lang, "ko");
+        assert_eq!(cfg.target_lang, "vi");
+        assert_eq!(cfg.compute_backend, ComputeBackend::CpuOnly);
+
+        cfg.apply_gaming_stream_profile();
+        assert_eq!(cfg.vad_mode, VadMode::Silero);
+        assert_eq!(cfg.silero_threshold_pct, 62.0);
+        assert_eq!(cfg.energy_threshold_pct, 2.5);
+        assert_eq!(cfg.min_speech_sec, 0.30);
+        assert_eq!(cfg.max_speech_sec, 6.5);
+        assert_eq!(cfg.silence_dur_sec, 0.70);
+        assert_eq!(cfg.context_pairs, 4);
+        assert_eq!(cfg.mic_device_id.as_deref(), Some("dev-in"));
+    }
+
+    #[test]
+    fn llm_presets_are_valid_unique_https_ggufs() {
+        use std::collections::HashSet;
+
+        assert_eq!(LLM_PRESETS.len(), 6);
+        assert_eq!(LLM_PRESETS[0].url, DEFAULT_LLM_URL);
+
+        let mut urls = HashSet::new();
+        let mut names = HashSet::new();
+        for preset in LLM_PRESETS {
+            let norm = normalize_hf_url(preset.url).expect("preset URL must normalize");
+            assert!(norm.starts_with("https://huggingface.co/"));
+            let fname = display_llm_name(&norm);
+            assert!(
+                fname.to_ascii_lowercase().ends_with(".gguf"),
+                "preset file must end with .gguf: {fname}"
+            );
+            assert!(urls.insert(norm), "duplicate preset URL: {}", preset.url);
+            assert!(
+                names.insert(fname.to_ascii_lowercase()),
+                "duplicate preset filename: {fname}"
+            );
+        }
     }
 }

@@ -14,7 +14,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::config::{language_prompt_name, ComputeBackend};
+use crate::config::{language_chinese_name, language_prompt_name, ComputeBackend};
 
 const N_CTX: u32 = 4096;
 const N_BATCH: usize = 1024;
@@ -73,6 +73,9 @@ enum LlmCmd {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptStyle {
     QwenNoThink,
+    HunyuanMt7B,
+    HunyuanMt18B,
+    TranslateGemma,
     EmbeddedTemplate,
     ChatMlFallback,
 }
@@ -85,7 +88,7 @@ pub fn build_translation_system_prompt(source_lang: &str, target_lang: &str) -> 
     };
     let tgt_desc = language_prompt_name(target_lang);
     format!(
-        "You are a fast, uncensored live stream subtitle translator. Translate ONLY the current {src_desc} line into ONE natural, idiomatic {tgt_desc} subtitle line. Use any provided recent context strictly for pronouns, names, and continuity — never repeat or re-translate context lines. Preserve slang, tone, humor, and profanity faithfully. If a speaker repeats a word excitedly, keep it natural and concise (at most 2-3 repetitions, never loop). Output ONLY the single-line {tgt_desc} translation with no explanations, quotes, romaji, brackets, or extra lines."
+        "You are a natural, uncensored real-time subtitle translator. Translate ONLY the user's current {src_desc} utterance into ONE clear, idiomatic {tgt_desc} subtitle line. Match the speaker's actual tone and register — stay calm and conversational for narration or vlogs, and preserve casual slang, humor, or profanity faithfully only when the speaker uses them. Use prior turns strictly for continuity of subjects, pronouns, names, and topics — never repeat or re-translate earlier lines. If the speaker repeats a word excitedly, keep it concise (at most 2-3 repetitions, never loop). Output ONLY the single-line {tgt_desc} translation with no explanations, quotes, romaji, brackets, or extra lines."
     )
 }
 
@@ -208,6 +211,7 @@ impl TranslationCoordinator {
                 let mut last_norm_orig = String::new();
                 let mut last_tl = String::new();
                 let mut locked_prefix = String::new();
+                let mut last_tl_used_prefix = false;
 
                 loop {
                     let mut req = {
@@ -231,12 +235,16 @@ impl TranslationCoordinator {
                         last_norm_orig.clear();
                         last_tl.clear();
                         locked_prefix.clear();
+                        last_tl_used_prefix = false;
                     }
 
                     let norm_orig = normalize_dedup_key(&req.text);
 
                     if req.is_final {
-                        if last_norm_orig == norm_orig && !last_tl.trim().is_empty() {
+                        if !last_tl_used_prefix
+                            && last_norm_orig == norm_orig
+                            && !last_tl.trim().is_empty()
+                        {
                             let cached_tl = last_tl.clone();
                             let conf_len = cached_tl.len();
                             llm.record_context(
@@ -256,15 +264,17 @@ impl TranslationCoordinator {
                             last_norm_orig.clear();
                             last_tl.clear();
                             locked_prefix.clear();
+                            last_tl_used_prefix = false;
                             continue;
                         }
                     } else if last_norm_orig == norm_orig {
                         continue;
                     }
 
-                    if req.forced_prefix.is_none() {
+                    if !req.is_final && req.forced_prefix.is_none() {
                         req.forced_prefix = prefill_prefix_for_prompt(&locked_prefix);
                     }
+                    let used_prefix = req.forced_prefix.is_some();
 
                     let uid = req.utterance_id;
                     let orig_for_cb = req.text.clone();
@@ -282,6 +292,7 @@ impl TranslationCoordinator {
                             last_norm_orig.clear();
                             last_tl.clear();
                             locked_prefix.clear();
+                            last_tl_used_prefix = false;
                         } else {
                             locked_prefix =
                                 compute_stable_prefix(&last_tl, &out.translation, &locked_prefix);
@@ -289,6 +300,7 @@ impl TranslationCoordinator {
                                 clamp_confirmed_bytes(&out.translation, &locked_prefix);
                             last_norm_orig = norm_orig;
                             last_tl = out.translation.clone();
+                            last_tl_used_prefix = used_prefix;
                         }
                     }
                     on_result(res);
@@ -362,7 +374,7 @@ fn worker_loop(rx: mpsc::Receiver<LlmCmd>) {
     backend.void_logs();
 
     let mut pending_load: Option<(PathBuf, ComputeBackend, Sender<Result<LoadInfo>>)> = None;
-    let mut rolling_history: VecDeque<(String, String)> = VecDeque::with_capacity(6);
+    let mut rolling_history: VecDeque<(String, String)> = VecDeque::with_capacity(8);
 
     loop {
         let (path, backend_pref, reply) = if let Some(item) = pending_load.take() {
@@ -462,14 +474,23 @@ fn load_and_serve_model(
 
     let style = detect_prompt_style(&model, path);
 
-    if style == PromptStyle::QwenNoThink {
-        let special_check = model.vocab().tokenize(b"<|im_start|>", false, true);
-        if special_check.len() != 1 {
-            bail!(
-                "Expected <|im_start|> to tokenize as 1 special token, got {}",
-                special_check.len()
-            );
+    match style {
+        PromptStyle::QwenNoThink => verify_special_tokens(&model, &["<|im_start|>"])?,
+        PromptStyle::HunyuanMt7B => {
+            verify_special_tokens(&model, &["<|startoftext|>", "<|extra_0|>"])?;
         }
+        PromptStyle::HunyuanMt18B => verify_special_tokens(
+            &model,
+            &[
+                "<｜hy_begin▁of▁sentence｜>",
+                "<｜hy_User｜>",
+                "<｜hy_Assistant｜>",
+            ],
+        )?,
+        PromptStyle::TranslateGemma => {
+            verify_special_tokens(&model, &["<start_of_turn>", "<end_of_turn>"])?;
+        }
+        PromptStyle::EmbeddedTemplate | PromptStyle::ChatMlFallback => {}
     }
 
     warmup_context(&model, &mut ctx, style)?;
@@ -614,28 +635,69 @@ fn load_model_only(
     }
 }
 
-fn detect_prompt_style(model: &LlamaModel, path: &Path) -> PromptStyle {
-    let fname = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+fn verify_special_tokens(model: &LlamaModel, tokens: &[&str]) -> Result<()> {
+    let vocab = model.vocab();
+    for &tok in tokens {
+        let toks = vocab.tokenize(tok.as_bytes(), false, true);
+        if toks.len() != 1 {
+            bail!(
+                "Expected {tok} to tokenize as 1 special token, got {}",
+                toks.len()
+            );
+        }
+    }
+    Ok(())
+}
 
-    if let Ok(tmpl) = model.chat_template(None) {
-        let tmpl_str = tmpl.to_str().unwrap_or("");
-        if tmpl_str.contains("<|im_start|>")
-            && (tmpl_str.contains("<think>") || fname.contains("qwen3"))
+fn detect_prompt_style_from_meta(tmpl_str: Option<&str>, fname_lower: &str) -> PromptStyle {
+    if fname_lower.contains("hy-mt") || fname_lower.contains("hunyuan-mt") {
+        if tmpl_str.is_some_and(|t| t.contains("<｜hy_User｜>")) {
+            return PromptStyle::HunyuanMt18B;
+        }
+        if tmpl_str.is_some_and(|t| t.contains("<|extra_0|>")) {
+            return PromptStyle::HunyuanMt7B;
+        }
+        if fname_lower.contains("1.8b") {
+            return PromptStyle::HunyuanMt18B;
+        }
+        return PromptStyle::HunyuanMt7B;
+    }
+
+    if fname_lower.contains("translategemma")
+        || tmpl_str.is_some_and(|t| {
+            t.contains("<start_of_turn>")
+                && t.contains("source_lang_code")
+                && t.contains("target_lang_code")
+        })
+    {
+        return PromptStyle::TranslateGemma;
+    }
+
+    if let Some(tmpl) = tmpl_str {
+        if tmpl.contains("<|im_start|>")
+            && (tmpl.contains("<think>") || fname_lower.contains("qwen3"))
         {
             return PromptStyle::QwenNoThink;
         }
         return PromptStyle::EmbeddedTemplate;
     }
 
-    if fname.contains("qwen3") {
+    if fname_lower.contains("qwen3") {
         PromptStyle::QwenNoThink
     } else {
         PromptStyle::ChatMlFallback
     }
+}
+
+fn detect_prompt_style(model: &LlamaModel, path: &Path) -> PromptStyle {
+    let fname = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let tmpl_cstr = model.chat_template(None).ok();
+    let tmpl_str = tmpl_cstr.as_ref().and_then(|c| c.to_str().ok());
+    detect_prompt_style_from_meta(tmpl_str, &fname)
 }
 
 fn warmup_context(
@@ -650,6 +712,8 @@ fn warmup_context(
         model,
         style,
         "You are a translator.",
+        "ja",
+        "en",
         &empty_hist,
         0,
         "こんにちは",
@@ -769,48 +833,196 @@ pub fn clamp_confirmed_bytes(translation: &str, locked_prefix: &str) -> usize {
     }
 }
 
+fn format_qwen_nothink_prompt(
+    system_prompt: &str,
+    history: &VecDeque<(String, String)>,
+    max_pairs: usize,
+    user_text: &str,
+    prefix_str: &str,
+) -> String {
+    let keep = max_pairs.min(history.len());
+    let start_idx = history.len().saturating_sub(keep);
+    let mut prompt = format!("<|im_start|>system\n{system_prompt}<|im_end|>\n");
+    for (src, tl) in history.iter().skip(start_idx) {
+        prompt.push_str(&format!(
+            "<|im_start|>user\n{src}<|im_end|>\n<|im_start|>assistant\n{tl}<|im_end|>\n"
+        ));
+    }
+    prompt.push_str(&format!(
+        "<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n{prefix_str}"
+    ));
+    prompt
+}
+
+fn format_hunyuan_mt_prompt(
+    is_18b: bool,
+    source_lang: &str,
+    target_lang: &str,
+    history: &VecDeque<(String, String)>,
+    max_pairs: usize,
+    user_text: &str,
+    prefix_str: &str,
+) -> String {
+    let keep = max_pairs.min(history.len());
+    let start_idx = history.len().saturating_sub(keep);
+    let is_zh_pair = source_lang.eq_ignore_ascii_case("zh")
+        || source_lang.eq_ignore_ascii_case("yue")
+        || target_lang.eq_ignore_ascii_case("zh");
+    let tgt_zh = language_chinese_name(target_lang);
+    let tgt_en = language_prompt_name(target_lang);
+
+    let body = if is_zh_pair {
+        if keep > 0 {
+            let ctx_lines: String = history
+                .iter()
+                .skip(start_idx)
+                .map(|(src, _)| src.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "{ctx_lines}\n参考上面的信息，把下面的文本翻译成{tgt_zh}，注意不需要翻译上文，也不要额外解释：\n{user_text}"
+            )
+        } else {
+            format!(
+                "将以下文本翻译为{tgt_zh}，注意只需要输出翻译后的结果，不要额外解释：\n\n{user_text}"
+            )
+        }
+    } else if keep > 0 {
+        let mut ctx = String::from("Previous context (for reference only, do not translate):\n");
+        for (src, tl) in history.iter().skip(start_idx) {
+            ctx.push_str(src);
+            ctx.push_str(" => ");
+            ctx.push_str(tl);
+            ctx.push('\n');
+        }
+        ctx.push_str(&format!(
+            "\nTranslate the following segment into {tgt_en}, without additional explanation.\n\n{user_text}"
+        ));
+        ctx
+    } else {
+        format!(
+            "Translate the following segment into {tgt_en}, without additional explanation.\n\n{user_text}"
+        )
+    };
+
+    if is_18b {
+        format!("<｜hy_begin▁of▁sentence｜><｜hy_User｜>{body}<｜hy_Assistant｜>{prefix_str}")
+    } else {
+        format!("<|startoftext|>{body}<|extra_0|>{prefix_str}")
+    }
+}
+
+fn build_chat_messages(
+    system_prompt: &str,
+    history: &VecDeque<(String, String)>,
+    max_pairs: usize,
+    user_text: &str,
+) -> Result<Vec<LlamaChatMessage>> {
+    let keep = max_pairs.min(history.len());
+    let start_idx = history.len().saturating_sub(keep);
+    let mut msgs = Vec::with_capacity(2 + keep * 2);
+    msgs.push(LlamaChatMessage::new(
+        "system".to_string(),
+        system_prompt.to_string(),
+    )?);
+    for (src, tl) in history.iter().skip(start_idx) {
+        msgs.push(LlamaChatMessage::new("user".to_string(), src.clone())?);
+        msgs.push(LlamaChatMessage::new("assistant".to_string(), tl.clone())?);
+    }
+    msgs.push(LlamaChatMessage::new(
+        "user".to_string(),
+        user_text.to_string(),
+    )?);
+    Ok(msgs)
+}
+
+fn translategemma_lang_spec(code: &str) -> (&str, &'static str) {
+    let trimmed = code.trim();
+    if trimmed.eq_ignore_ascii_case("yue") {
+        ("zh-Hant-HK", "Chinese")
+    } else {
+        (trimmed, language_prompt_name(trimmed))
+    }
+}
+
+fn format_translategemma_prompt(
+    source_lang: &str,
+    target_lang: &str,
+    user_text: &str,
+    prefix_str: &str,
+) -> String {
+    let (tgt_code, tgt_name) = translategemma_lang_spec(target_lang);
+    if source_lang.eq_ignore_ascii_case("auto") {
+        format!(
+            "<start_of_turn>user\nYou are a professional translator. Your goal is to accurately convey the meaning and nuances of the original text while adhering to {tgt_name} ({tgt_code}) grammar, vocabulary, and cultural sensitivities.\nProduce only the {tgt_name} translation, without any additional explanations or commentary. Please translate the following text into {tgt_name}:\n\n\n{user_text}<end_of_turn>\n<start_of_turn>model\n{prefix_str}"
+        )
+    } else {
+        let (src_code, src_name) = translategemma_lang_spec(source_lang);
+        format!(
+            "<start_of_turn>user\nYou are a professional {src_name} ({src_code}) to {tgt_name} ({tgt_code}) translator. Your goal is to accurately convey the meaning and nuances of the original {src_name} text while adhering to {tgt_name} grammar, vocabulary, and cultural sensitivities.\nProduce only the {tgt_name} translation, without any additional explanations or commentary. Please translate the following {src_name} text into {tgt_name}:\n\n\n{user_text}<end_of_turn>\n<start_of_turn>model\n{prefix_str}"
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_prompt(
     model: &LlamaModel,
     style: PromptStyle,
     system_prompt: &str,
+    source_lang: &str,
+    target_lang: &str,
     history: &VecDeque<(String, String)>,
     max_pairs: usize,
     user_text: &str,
     forced_prefix: Option<&str>,
 ) -> Result<(String, bool)> {
-    let keep = max_pairs.min(history.len());
-    let start_idx = history.len().saturating_sub(keep);
-
-    let user_msg = if keep == 0 {
-        user_text.to_string()
-    } else {
-        let mut s =
-            String::from("Recent context (reference only — DO NOT translate or repeat):\n");
-        for (src, tl) in history.iter().skip(start_idx) {
-            s.push_str(&format!("- {src} -> {tl}\n"));
-        }
-        s.push_str("\nTranslate ONLY this current line:\n");
-        s.push_str(user_text);
-        s
-    };
-
     let prefix_str = forced_prefix.unwrap_or("");
 
     match style {
         PromptStyle::QwenNoThink => {
-            let prompt = format!(
-                "<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_msg}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n{prefix_str}"
+            let prompt = format_qwen_nothink_prompt(
+                system_prompt,
+                history,
+                max_pairs,
+                user_text,
+                prefix_str,
             );
             Ok((prompt, false))
+        }
+        PromptStyle::HunyuanMt7B => {
+            let prompt = format_hunyuan_mt_prompt(
+                false,
+                source_lang,
+                target_lang,
+                history,
+                max_pairs,
+                user_text,
+                prefix_str,
+            );
+            Ok((prompt, false))
+        }
+        PromptStyle::HunyuanMt18B => {
+            let prompt = format_hunyuan_mt_prompt(
+                true,
+                source_lang,
+                target_lang,
+                history,
+                max_pairs,
+                user_text,
+                prefix_str,
+            );
+            Ok((prompt, false))
+        }
+        PromptStyle::TranslateGemma => {
+            let prompt =
+                format_translategemma_prompt(source_lang, target_lang, user_text, prefix_str);
+            Ok((prompt, model.vocab().should_add_bos()))
         }
         PromptStyle::EmbeddedTemplate => {
             let tmpl = model
                 .chat_template(None)
                 .map_err(|e| anyhow!("Missing chat template: {e}"))?;
-            let msgs = vec![
-                LlamaChatMessage::new("system".to_string(), system_prompt.to_string())?,
-                LlamaChatMessage::new("user".to_string(), user_msg)?,
-            ];
+            let msgs = build_chat_messages(system_prompt, history, max_pairs, user_text)?;
             let mut prompt = model
                 .apply_chat_template(&tmpl, &msgs, true)
                 .context("Failed to apply model chat template")?;
@@ -826,10 +1038,7 @@ fn build_prompt(
         }
         PromptStyle::ChatMlFallback => {
             let fallback = LlamaChatTemplate::new("chatml")?;
-            let msgs = vec![
-                LlamaChatMessage::new("system".to_string(), system_prompt.to_string())?,
-                LlamaChatMessage::new("user".to_string(), user_msg)?,
-            ];
+            let msgs = build_chat_messages(system_prompt, history, max_pairs, user_text)?;
             let mut prompt = model
                 .apply_chat_template(&fallback, &msgs, true)
                 .context("Failed to apply ChatML fallback template")?;
@@ -1095,6 +1304,16 @@ fn utf8_streaming_slice(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
     }
 }
 
+const STOP_MARKERS: &[&str] = &[
+    "<|im_end|>",
+    "<|endoftext|>",
+    "<|eot_id|>",
+    "<|eos|>",
+    "<end_of_turn>",
+    "<｜hy_place▁holder▁no▁2｜>",
+    "<｜hy_place▁holder▁no▁8｜>",
+];
+
 pub fn clean_translation_output(raw: &str) -> String {
     let mut s = if let Some(idx) = raw.rfind("</think>") {
         &raw[idx + "</think>".len()..]
@@ -1104,7 +1323,7 @@ pub fn clean_translation_output(raw: &str) -> String {
         raw
     };
 
-    for stop in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
+    for stop in STOP_MARKERS {
         if let Some(idx) = s.find(stop) {
             s = &s[..idx];
         }
@@ -1160,6 +1379,8 @@ fn run_translate_inner(
         model,
         style,
         &system_prompt,
+        &req.source_lang,
+        &req.target_lang,
         history,
         req.context_pairs,
         &original,
@@ -1191,11 +1412,21 @@ fn run_translate_inner(
             .context("Failed to decode prompt batch")?;
     }
 
-    let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::penalties(model.n_vocab(), 64, 1.18, 0.25, 0.15),
-        LlamaSampler::dry(model, 0.8, 1.75, 2, 64, ["\n", ":", "\"", "*"]),
-        LlamaSampler::greedy(),
-    ]);
+    let mut sampler = match style {
+        PromptStyle::HunyuanMt7B | PromptStyle::HunyuanMt18B | PromptStyle::TranslateGemma => {
+            LlamaSampler::chain_simple([
+                LlamaSampler::penalties(model.n_vocab(), 64, 1.05, 0.0, 0.0),
+                LlamaSampler::greedy(),
+            ])
+        }
+        PromptStyle::QwenNoThink | PromptStyle::EmbeddedTemplate | PromptStyle::ChatMlFallback => {
+            LlamaSampler::chain_simple([
+                LlamaSampler::penalties(model.n_vocab(), 64, 1.08, 0.05, 0.05),
+                LlamaSampler::dry(model, 0.5, 1.75, 3, 64, ["\n", ":", "\"", "*"]),
+                LlamaSampler::greedy(),
+            ])
+        }
+    };
     if let Some(p) = prefill {
         let prefill_toks = vocab.tokenize(p.as_bytes(), false, false);
         sampler.accept_many(&prefill_toks);
@@ -1216,7 +1447,7 @@ fn run_translate_inner(
         vocab.token_to_piece_into(token, &mut output_bytes, false, None);
 
         let visible_utf8 = utf8_streaming_slice(&output_bytes);
-        if visible_utf8.ends_with("<|im_end|>") || visible_utf8.ends_with("<|endoftext|>") {
+        if STOP_MARKERS.iter().any(|stop| visible_utf8.ends_with(stop)) {
             break;
         }
 
@@ -1453,5 +1684,130 @@ mod tests {
         assert!(p.contains("Japanese"));
         assert!(p.contains("English"));
         assert!(p.contains("Output ONLY"));
+    }
+
+    #[test]
+    fn detects_prompt_styles_for_all_presets() {
+        assert_eq!(
+            detect_prompt_style_from_meta(
+                Some("<|startoftext|>{{content}}<|extra_0|>"),
+                "hy-mt1.5-7b-q4_k_m.gguf",
+            ),
+            PromptStyle::HunyuanMt7B
+        );
+        assert_eq!(
+            detect_prompt_style_from_meta(
+                Some("<｜hy_begin▁of▁sentence｜><｜hy_User｜>{{content}}<｜hy_Assistant｜>"),
+                "hy-mt1.5-1.8b-q8_0.gguf",
+            ),
+            PromptStyle::HunyuanMt18B
+        );
+        assert_eq!(
+            detect_prompt_style_from_meta(
+                Some("<|im_start|>assistant\n<think>\n"),
+                "qwen3.5-9b-uncensored-hauhaucs-aggressive-q4_k_m.gguf",
+            ),
+            PromptStyle::QwenNoThink
+        );
+        assert_eq!(
+            detect_prompt_style_from_meta(
+                Some("<|im_start|>assistant\n<think>\n"),
+                "qwen3.5-4b-uncensored-hauhaucs-aggressive-q4_k_m.gguf",
+            ),
+            PromptStyle::QwenNoThink
+        );
+        assert_eq!(
+            detect_prompt_style_from_meta(
+                Some("<|im_start|>system\n{{content}}<|im_end|>"),
+                "shisa-v2.1-qwen3-8b.q4_k_m.gguf",
+            ),
+            PromptStyle::QwenNoThink
+        );
+        assert_eq!(
+            detect_prompt_style_from_meta(
+                Some("<start_of_turn>user\nsource_lang_code target_lang_code"),
+                "translategemma-12b-it.q4_k_m.gguf",
+            ),
+            PromptStyle::TranslateGemma
+        );
+        assert_eq!(
+            detect_prompt_style_from_meta(
+                Some("{{ bos_token }}<start_of_turn>user\n{{ content }}<end_of_turn>"),
+                "tower-plus-9b.q4_k_m.gguf",
+            ),
+            PromptStyle::EmbeddedTemplate
+        );
+    }
+
+    #[test]
+    fn formats_hunyuan_mt_prompts_correctly() {
+        let empty = VecDeque::new();
+        let p7 = format_hunyuan_mt_prompt(false, "ja", "en", &empty, 0, "おはよ", "");
+        assert!(p7.starts_with("<|startoftext|>Translate the following segment into English"));
+        assert!(p7.ends_with("おはよ<|extra_0|>"));
+
+        let p18_zh = format_hunyuan_mt_prompt(true, "zh", "en", &empty, 0, "你好", "Hello");
+        assert!(p18_zh.starts_with("<｜hy_begin▁of▁sentence｜><｜hy_User｜>将以下文本翻译为英语"));
+        assert!(p18_zh.ends_with("你好<｜hy_Assistant｜>Hello"));
+
+        let mut hist = VecDeque::new();
+        hist.push_back(("前の文".to_string(), "Previous line".to_string()));
+        let p_ctx_ja = format_hunyuan_mt_prompt(false, "ja", "en", &hist, 2, "次の文", "");
+        assert!(p_ctx_ja.contains("Previous context (for reference only, do not translate):\n前の文 => Previous line\n\nTranslate the following segment into English, without additional explanation.\n\n次の文"));
+        assert!(p_ctx_ja.ends_with("次の文<|extra_0|>"));
+
+        let mut zh_hist = VecDeque::new();
+        zh_hist.push_back(("前一句".to_string(), "Previous line".to_string()));
+        let p_ctx_zh = format_hunyuan_mt_prompt(false, "zh", "en", &zh_hist, 2, "下一句", "");
+        assert!(p_ctx_zh.contains("前一句\n参考上面的信息，把下面的文本翻译成英语"));
+        assert!(p_ctx_zh.ends_with("下一句<|extra_0|>"));
+    }
+
+    #[test]
+    fn formats_qwen_nothink_multiturn_history_correctly() {
+        let mut hist = VecDeque::new();
+        hist.push_back(("ここ道が悪いね".to_string(), "The road is rough here.".to_string()));
+        hist.push_back(("車がガタガタしてる".to_string(), "The car is rattling.".to_string()));
+        let prompt = format_qwen_nothink_prompt(
+            "SYS",
+            &hist,
+            2,
+            "だからゆっくり走っています",
+            "So we're",
+        );
+        let expected = "<|im_start|>system\nSYS<|im_end|>\n<|im_start|>user\nここ道が悪いね<|im_end|>\n<|im_start|>assistant\nThe road is rough here.<|im_end|>\n<|im_start|>user\n車がガタガタしてる<|im_end|>\n<|im_start|>assistant\nThe car is rattling.<|im_end|>\n<|im_start|>user\nだからゆっくり走っています<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nSo we're";
+        assert_eq!(prompt, expected);
+    }
+
+    #[test]
+    fn formats_translategemma_prompts_correctly() {
+        let p = format_translategemma_prompt("ja", "en", "すごい", "");
+        assert!(p.starts_with("<start_of_turn>user\nYou are a professional Japanese (ja) to English (en) translator."));
+        assert!(p.contains("\n\n\nすごい<end_of_turn>\n<start_of_turn>model\n"));
+
+        let p_yue = format_translategemma_prompt("yue", "en", "多謝", "Thanks");
+        assert!(p_yue.contains("Chinese (zh-Hant-HK) to English (en)"));
+        assert!(p_yue.ends_with("<start_of_turn>model\nThanks"));
+
+        let p_auto = format_translategemma_prompt("auto", "en", "Hola", "");
+        assert!(p_auto.contains("You are a professional translator."));
+        assert!(p_auto.contains("translate the following text into English:\n\n\nHola<end_of_turn>"));
+    }
+
+    #[test]
+    fn clean_translation_output_strips_new_model_stop_markers() {
+        assert_eq!(
+            clean_translation_output("Good morning<end_of_turn>"),
+            "Good morning"
+        );
+        assert_eq!(clean_translation_output("Nice!<|eos|>"), "Nice!");
+        assert_eq!(
+            clean_translation_output("Let's go<｜hy_place▁holder▁no▁2｜>"),
+            "Let's go"
+        );
+        assert_eq!(
+            clean_translation_output("Check this<｜hy_place▁holder▁no▁8｜>"),
+            "Check this"
+        );
     }
 }

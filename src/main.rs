@@ -154,7 +154,10 @@ fn run_self_test(smoke_only: bool) -> Result<()> {
     let llm_path = match config::resolve_existing_llm_path(&model_dir, &llm_url) {
         Some(p) => p,
         None => {
-            println!("Downloading default Qwen3.5-4B Q4_K_M GGUF...");
+            println!(
+                "Downloading default LLM ({})...",
+                config::display_llm_name(&llm_url)
+            );
             let cancel = Arc::new(AtomicBool::new(false));
             downloader::download_llm_model(&llm_url, &model_dir, cancel, |_| {})?
         }

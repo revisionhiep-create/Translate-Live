@@ -1858,7 +1858,7 @@ impl OverlayDisplayHold {
                     .map(|t| now.saturating_duration_since(t).as_secs_f32())
                     .unwrap_or(f32::MAX);
                 let effective_dwell = if pending >= 2 {
-                    (min_display_sec * 0.75).max(0.85).min(min_display_sec)
+                    (min_display_sec * 0.65).max(0.45).min(min_display_sec)
                 } else {
                     min_display_sec
                 };

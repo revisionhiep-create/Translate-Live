@@ -2260,7 +2260,7 @@ impl TranslateLiveApp {
             ui.add_enabled_ui(!locked, |ui| {
                 egui::ComboBox::from_id_salt("llm_preset_combo")
                     .width(ui.available_width())
-                    .height(240.0)
+                    .height(290.0)
                     .selected_text(selected_label)
                     .show_ui(ui, |ui| {
                         for preset in LLM_PRESETS {
@@ -2646,7 +2646,7 @@ impl TranslateLiveApp {
                         .color(theme.text_muted),
                 );
                 if ui
-                    .add(egui::Slider::new(&mut self.config.audio_vad.context_pairs, 0..=5))
+                    .add(egui::Slider::new(&mut self.config.audio_vad.context_pairs, 0..=8))
                     .changed()
                 {
                     changed = true;
@@ -2659,12 +2659,48 @@ impl TranslateLiveApp {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
 
-            ui.label(
-                egui::RichText::new("VAD Thresholds & Timing")
-                    .size(13.0)
-                    .strong()
-                    .color(theme.text_primary),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("VAD Thresholds & Timing")
+                        .size(13.0)
+                        .strong()
+                        .color(theme.text_primary),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Gaming / BGM Stream")
+                                    .size(11.0)
+                                    .color(theme.text_muted),
+                            )
+                            .fill(egui::Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::new(1.0_f32, theme.border_subtle))
+                            .corner_radius(egui::CornerRadius::same(5)),
+                        )
+                        .clicked()
+                    {
+                        self.config.audio_vad.apply_gaming_stream_profile();
+                        changed = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("General / YouTube")
+                                    .size(11.0)
+                                    .color(theme.text_primary),
+                            )
+                            .fill(theme.btn_sec_bg)
+                            .stroke(egui::Stroke::new(1.0_f32, theme.border_med))
+                            .corner_radius(egui::CornerRadius::same(5)),
+                        )
+                        .clicked()
+                    {
+                        self.config.audio_vad.apply_general_video_profile();
+                        changed = true;
+                    }
+                });
+            });
 
             // Live meters for interactive threshold tuning
             let rms = f32::from_bits(self.rms_bits.load(Ordering::Relaxed)).clamp(0.0, 1.0);

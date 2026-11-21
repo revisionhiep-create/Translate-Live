@@ -19,6 +19,127 @@ use crate::config::{
 
 const SAMPLE_RATE: i32 = 16000;
 const WINDOW_SAMPLES: usize = 512; // 32 ms at 16 kHz
+const CLAUSE_HOLD_SILENCE_MS: u64 = 650;
+const CLAUSE_HOLD_MAX_TOTAL_MS: u64 = 3200;
+const CLAUSE_STITCH_MAX_CHARS: usize = 28;
+
+fn is_cjk_no_space_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3000..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFF01..=0xFFEF
+    )
+}
+
+pub fn ends_with_incomplete_clause(text: &str, source_lang: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.ends_with(['。', '！', '？', '!', '?', '.']) {
+        return false;
+    }
+    let is_cjk = source_lang.eq_ignore_ascii_case("ja")
+        || source_lang.eq_ignore_ascii_case("ko")
+        || source_lang.eq_ignore_ascii_case("zh")
+        || source_lang.eq_ignore_ascii_case("yue")
+        || source_lang.eq_ignore_ascii_case("auto");
+    if is_cjk && trimmed.ends_with([',', '、']) {
+        return true;
+    }
+
+    if source_lang.eq_ignore_ascii_case("ja") || source_lang.eq_ignore_ascii_case("auto") {
+        const JA_INCOMPLETE: &[&str] = &[
+            "ってことは",
+            "けれども",
+            "について",
+            "っていう",
+            "けれど",
+            "だけど",
+            "なので",
+            "だから",
+            "それで",
+            "そして",
+            "しかし",
+            "ながら",
+            "ために",
+            "ように",
+            "という",
+            "として",
+            "えっと",
+            "なんか",
+            "ので",
+            "から",
+            "けど",
+            "でも",
+            "のに",
+            "あの",
+            "は",
+            "が",
+            "を",
+            "に",
+            "へ",
+            "と",
+            "で",
+            "て",
+        ];
+        if JA_INCOMPLETE.iter().any(|s| trimmed.ends_with(s)) {
+            return true;
+        }
+    }
+
+    if source_lang.eq_ignore_ascii_case("ko") {
+        const KO_INCOMPLETE: &[&str] = &[
+            "그래서",
+            "그런데",
+            "그리고",
+            "하지만",
+            "는데",
+            "은데",
+            "ㄴ데",
+            "니까",
+            "면서",
+            "지만",
+            "서",
+            "고",
+            "면",
+        ];
+        if KO_INCOMPLETE.iter().any(|s| trimmed.ends_with(s)) {
+            return true;
+        }
+    }
+
+    if source_lang.eq_ignore_ascii_case("zh") || source_lang.eq_ignore_ascii_case("yue") {
+        const ZH_INCOMPLETE: &[&str] = &[
+            "因为", "所以", "但是", "不过", "而且", "如果", "然后", "就是",
+        ];
+        if ZH_INCOMPLETE.iter().any(|s| trimmed.ends_with(s)) {
+            return true;
+        }
+    }
+
+    false
+}
+
+pub fn stitch_clause_text(prev: &str, next: &str, source_lang: &str) -> String {
+    let p = prev.trim();
+    let n = next.trim();
+    if p.is_empty() {
+        return n.to_string();
+    }
+    if n.is_empty() {
+        return p.to_string();
+    }
+    let no_space = source_lang.eq_ignore_ascii_case("ja")
+        || source_lang.eq_ignore_ascii_case("zh")
+        || source_lang.eq_ignore_ascii_case("yue")
+        || (p.chars().last().is_some_and(is_cjk_no_space_char)
+            && n.chars().next().is_some_and(is_cjk_no_space_char));
+    if no_space {
+        format!("{p}{n}")
+    } else {
+        format!("{p} {n}")
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum AsrEvent {
@@ -748,6 +869,164 @@ fn silero_params_changed(a: &AudioVadConfig, b: &AudioVadConfig) -> bool {
         || (a.silence_dur_sec - b.silence_dur_sec).abs() > 0.01
 }
 
+struct PendingClause {
+    text: String,
+    started_at: Instant,
+    held_at: Instant,
+    total_asr_ms: u128,
+}
+
+struct UtteranceEmitter<'a> {
+    pending_clause: Option<PendingClause>,
+    utterance_id: u64,
+    utterance_had_interim: bool,
+    last_interim_text: String,
+    on_event: &'a Arc<dyn Fn(AsrEvent) + Send + Sync>,
+}
+
+impl UtteranceEmitter<'_> {
+    fn flush_pending(&mut self) {
+        if let Some(p) = self.pending_clause.take() {
+            (self.on_event)(AsrEvent::Final {
+                utterance_id: self.utterance_id,
+                text: p.text,
+                asr_ms: p.total_asr_ms,
+            });
+            self.utterance_id += 1;
+            self.utterance_had_interim = false;
+            self.last_interim_text.clear();
+        }
+    }
+
+    fn maybe_flush_expired(&mut self, in_speech: bool) {
+        if let Some(ref p) = self.pending_clause {
+            let silence_expired =
+                !in_speech && p.held_at.elapsed() >= Duration::from_millis(CLAUSE_HOLD_SILENCE_MS);
+            let max_total_expired =
+                p.started_at.elapsed() >= Duration::from_millis(CLAUSE_HOLD_MAX_TOTAL_MS);
+            if silence_expired || max_total_expired {
+                self.flush_pending();
+            }
+        }
+    }
+
+    fn emit_interim(&mut self, raw_text: String, asr_ms: u128, source_lang: &str) {
+        let display_text = if let Some(ref p) = self.pending_clause {
+            stitch_clause_text(&p.text, &raw_text, source_lang)
+        } else {
+            raw_text
+        };
+        if normalize_transcript_key(&display_text)
+            != normalize_transcript_key(&self.last_interim_text)
+        {
+            self.last_interim_text = display_text.clone();
+            self.utterance_had_interim = true;
+            (self.on_event)(AsrEvent::Interim {
+                utterance_id: self.utterance_id,
+                text: display_text,
+                asr_ms,
+            });
+        }
+    }
+
+    fn handle_final_segment(
+        &mut self,
+        maybe_text: Option<String>,
+        asr_ms: u128,
+        source_lang: &str,
+    ) -> bool {
+        let Some(text) = maybe_text else {
+            if self.pending_clause.is_none() && self.utterance_had_interim {
+                self.utterance_id += 1;
+                self.utterance_had_interim = false;
+                self.last_interim_text.clear();
+            }
+            return false;
+        };
+
+        let had_prev = self.pending_clause.is_some();
+        let total_asr_ms = self
+            .pending_clause
+            .as_ref()
+            .map_or(0, |p| p.total_asr_ms)
+            .saturating_add(asr_ms);
+        let (combined, started_at) = match self.pending_clause.take() {
+            Some(p) => (stitch_clause_text(&p.text, &text, source_lang), p.started_at),
+            None => (text, Instant::now()),
+        };
+
+        let char_len = combined.chars().count();
+        let max_chars = if had_prev {
+            CLAUSE_STITCH_MAX_CHARS
+        } else {
+            22
+        };
+        let within_time =
+            started_at.elapsed() < Duration::from_millis(CLAUSE_HOLD_MAX_TOTAL_MS);
+
+        if ends_with_incomplete_clause(&combined, source_lang)
+            && char_len < max_chars
+            && within_time
+        {
+            self.pending_clause = Some(PendingClause {
+                text: combined.clone(),
+                started_at,
+                held_at: Instant::now(),
+                total_asr_ms,
+            });
+            if normalize_transcript_key(&combined)
+                != normalize_transcript_key(&self.last_interim_text)
+            {
+                self.last_interim_text = combined.clone();
+                self.utterance_had_interim = true;
+                (self.on_event)(AsrEvent::Interim {
+                    utterance_id: self.utterance_id,
+                    text: combined,
+                    asr_ms: total_asr_ms,
+                });
+            }
+            false
+        } else {
+            (self.on_event)(AsrEvent::Final {
+                utterance_id: self.utterance_id,
+                text: combined,
+                asr_ms: total_asr_ms,
+            });
+            self.utterance_id += 1;
+            self.utterance_had_interim = false;
+            self.last_interim_text.clear();
+            true
+        }
+    }
+
+    fn emit_disconnect_segment(
+        &mut self,
+        maybe_text: Option<String>,
+        asr_ms: u128,
+        source_lang: &str,
+    ) {
+        if let Some(text) = maybe_text {
+            let total_asr_ms = self
+                .pending_clause
+                .as_ref()
+                .map_or(0, |p| p.total_asr_ms)
+                .saturating_add(asr_ms);
+            let final_text = match self.pending_clause.take() {
+                Some(p) => stitch_clause_text(&p.text, &text, source_lang),
+                None => text,
+            };
+            (self.on_event)(AsrEvent::Final {
+                utterance_id: self.utterance_id,
+                text: final_text,
+                asr_ms: total_asr_ms,
+            });
+            self.utterance_id += 1;
+            self.utterance_had_interim = false;
+            self.last_interim_text.clear();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn asr_worker_loop(
     asr_dir: PathBuf,
@@ -801,19 +1080,33 @@ fn asr_worker_loop(
     let mut speech_started = false;
     let mut speech_started_at = Instant::now();
     let mut last_interim_at = Instant::now();
-    let mut last_interim_text = String::new();
     let mut smoothed_prob = 0.0f32;
     let mut quiet_start: Option<Instant> = None;
-    let mut utterance_id: u64 = 1;
-    let mut utterance_had_interim = false;
     let mut has_new_speech_since_interim = false;
     let mut pause_started_at: Option<Instant> = None;
+    let mut emitter = UtteranceEmitter {
+        pending_clause: None,
+        utterance_id: 1,
+        utterance_had_interim: false,
+        last_interim_text: String::new(),
+        on_event: &on_event,
+    };
 
     while !stop_flag.load(Ordering::Relaxed) {
         let samples = match audio_rx.recv_timeout(Duration::from_millis(40)) {
-            Ok(s) => s,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Ok(s) => Some(s),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        let in_speech_now = match active_cfg.vad_mode {
+            VadMode::Silero => speech_started,
+            VadMode::Energy => energy_vad.in_speech(),
+        };
+        emitter.maybe_flush_expired(in_speech_now);
+
+        let Some(samples) = samples else {
+            continue;
         };
 
         // Check for live VAD/timing updates from UI
@@ -827,20 +1120,24 @@ fn asr_worker_loop(
         last_seen_vad_mode = latest.vad_mode;
 
         let mut next_cfg = latest;
+        if next_cfg.source_lang != active_cfg.source_lang {
+            emitter.flush_pending();
+        }
         if ui_mode_changed || silero_param_dirty {
+            emitter.flush_pending();
             if next_cfg.vad_mode == VadMode::Silero {
                 last_silero_attempt_cfg = next_cfg.clone();
                 match create_silero_vad(&silero_path, &next_cfg) {
                     Ok(v) => {
                         silero_vad = Some(v);
                         applied_silero_cfg = Some(next_cfg.clone());
-                        if utterance_had_interim {
-                            utterance_id += 1;
-                            utterance_had_interim = false;
+                        if emitter.utterance_had_interim {
+                            emitter.utterance_id += 1;
+                            emitter.utterance_had_interim = false;
                         }
                         silero_active_buf.clear();
                         speech_started = false;
-                        last_interim_text.clear();
+                        emitter.last_interim_text.clear();
                         has_new_speech_since_interim = false;
                         pause_started_at = None;
                         quiet_start = None;
@@ -856,13 +1153,13 @@ fn asr_worker_loop(
             } else {
                 silero_vad = None;
                 applied_silero_cfg = None;
-                if utterance_had_interim {
-                    utterance_id += 1;
-                    utterance_had_interim = false;
+                if emitter.utterance_had_interim {
+                    emitter.utterance_id += 1;
+                    emitter.utterance_had_interim = false;
                 }
                 silero_active_buf.clear();
                 speech_started = false;
-                last_interim_text.clear();
+                emitter.last_interim_text.clear();
                 has_new_speech_since_interim = false;
                 pause_started_at = None;
                 quiet_start = None;
@@ -907,7 +1204,7 @@ fn asr_worker_loop(
                             speech_started = true;
                             speech_started_at = Instant::now();
                             last_interim_at = Instant::now();
-                            last_interim_text.clear();
+                            emitter.last_interim_text.clear();
                         }
                         silero_active_buf.extend_from_slice(&chunk);
                         let max_samples = (active_cfg.max_speech_sec * SAMPLE_RATE as f32) as usize;
@@ -945,28 +1242,23 @@ fn asr_worker_loop(
                     while !vad.is_empty() {
                         if let Some(segment) = vad.front() {
                             vad.pop();
-                            let mut emitted_this_seg = false;
                             let samples = segment.samples();
-                            if energy_gate <= 0.0 || foreground_rms(samples) >= energy_gate {
-                                let (maybe_text, asr_ms) = decode_samples(&recognizer, samples);
-                                if let Some(text) = maybe_text {
-                                    on_event(AsrEvent::Final {
-                                        utterance_id,
-                                        text,
-                                        asr_ms,
-                                    });
-                                    emitted_this_seg = true;
-                                    emitted_final = true;
-                                }
-                            }
-                            if emitted_this_seg || utterance_had_interim {
-                                utterance_id += 1;
-                                utterance_had_interim = false;
+                            let (maybe_text, asr_ms) =
+                                if energy_gate <= 0.0 || foreground_rms(samples) >= energy_gate {
+                                    decode_samples(&recognizer, samples)
+                                } else {
+                                    (None, 0)
+                                };
+                            if emitter.handle_final_segment(
+                                maybe_text,
+                                asr_ms,
+                                &active_cfg.source_lang,
+                            ) {
+                                emitted_final = true;
                             }
                         }
                         silero_active_buf.clear();
                         speech_started = false;
-                        last_interim_text.clear();
                         quiet_start = None;
                         has_new_speech_since_interim = false;
                         pause_started_at = None;
@@ -992,17 +1284,7 @@ fn asr_worker_loop(
                         let (maybe_text, asr_ms) = decode_samples(&recognizer, &silero_active_buf);
                         last_interim_at = Instant::now();
                         if let Some(text) = maybe_text {
-                            if normalize_transcript_key(&text)
-                                != normalize_transcript_key(&last_interim_text)
-                            {
-                                last_interim_text = text.clone();
-                                utterance_had_interim = true;
-                                on_event(AsrEvent::Interim {
-                                    utterance_id,
-                                    text,
-                                    asr_ms,
-                                });
-                            }
+                            emitter.emit_interim(text, asr_ms, &active_cfg.source_lang);
                         }
                     }
                 }
@@ -1013,20 +1295,7 @@ fn asr_worker_loop(
 
                     if let Some(seg) = maybe_seg {
                         let (maybe_text, asr_ms) = decode_samples(&recognizer, &seg);
-                        let mut emitted_this_seg = false;
-                        if let Some(text) = maybe_text {
-                            on_event(AsrEvent::Final {
-                                utterance_id,
-                                text,
-                                asr_ms,
-                            });
-                            emitted_this_seg = true;
-                        }
-                        if emitted_this_seg || utterance_had_interim {
-                            utterance_id += 1;
-                            utterance_had_interim = false;
-                        }
-                        last_interim_text.clear();
+                        emitter.handle_final_segment(maybe_text, asr_ms, &active_cfg.source_lang);
                     } else if energy_vad.in_speech()
                         && active_cfg.incremental_asr
                         && last_interim_at.elapsed().as_secs_f32()
@@ -1039,17 +1308,7 @@ fn asr_worker_loop(
                             decode_samples(&recognizer, energy_vad.active_samples());
                         last_interim_at = Instant::now();
                         if let Some(text) = maybe_text {
-                            if normalize_transcript_key(&text)
-                                != normalize_transcript_key(&last_interim_text)
-                            {
-                                last_interim_text = text.clone();
-                                utterance_had_interim = true;
-                                on_event(AsrEvent::Interim {
-                                    utterance_id,
-                                    text,
-                                    asr_ms,
-                                });
-                            }
+                            emitter.emit_interim(text, asr_ms, &active_cfg.source_lang);
                         }
                     }
                 }
@@ -1068,29 +1327,21 @@ fn asr_worker_loop(
                     let samples = segment.samples();
                     if energy_gate <= 0.0 || foreground_rms(samples) >= energy_gate {
                         let (maybe_text, asr_ms) = decode_samples(&recognizer, samples);
-                        if let Some(text) = maybe_text {
-                            on_event(AsrEvent::Final {
-                                utterance_id,
-                                text,
-                                asr_ms,
-                            });
-                            utterance_id += 1;
-                        }
+                        emitter.emit_disconnect_segment(
+                            maybe_text,
+                            asr_ms,
+                            &active_cfg.source_lang,
+                        );
                     }
                 }
             }
         } else if let Some(seg) = energy_vad.flush() {
             if energy_gate <= 0.0 || foreground_rms(&seg) >= energy_gate {
                 let (maybe_text, asr_ms) = decode_samples(&recognizer, &seg);
-                if let Some(text) = maybe_text {
-                    on_event(AsrEvent::Final {
-                        utterance_id,
-                        text,
-                        asr_ms,
-                    });
-                }
+                emitter.emit_disconnect_segment(maybe_text, asr_ms, &active_cfg.source_lang);
             }
         }
+        emitter.flush_pending();
     }
     vad_prob_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
 }
@@ -1326,6 +1577,51 @@ mod tests {
         assert_eq!(
             normalize_transcript_key("えーと"),
             normalize_transcript_key("えーと、")
+        );
+    }
+
+    #[test]
+    fn ends_with_incomplete_clause_detects_mid_clause_markers_and_ignores_finals() {
+        // Japanese incomplete clauses
+        assert!(ends_with_incomplete_clause("ゆっくり走っているので", "ja"));
+        assert!(ends_with_incomplete_clause("車は", "ja"));
+        assert!(ends_with_incomplete_clause("えっと、", "ja"));
+        assert!(ends_with_incomplete_clause("ゆっくりと", "auto"));
+        // Japanese complete / terminal particles or punctuation
+        assert!(!ends_with_incomplete_clause("ゆっくり走っているので。", "ja"));
+        assert!(!ends_with_incomplete_clause("行こうよ", "ja"));
+        assert!(!ends_with_incomplete_clause("そうですね", "ja"));
+        assert!(!ends_with_incomplete_clause("本当ですか？", "ja"));
+
+        // Korean & Chinese
+        assert!(ends_with_incomplete_clause("천천히 가고 있는데", "ko"));
+        assert!(!ends_with_incomplete_clause("천천히 가고 있어요.", "ko"));
+        assert!(ends_with_incomplete_clause("今天车很多所以", "zh"));
+        assert!(ends_with_incomplete_clause("如果", "zh"));
+        assert!(ends_with_incomplete_clause("所以", "yue"));
+        assert!(!ends_with_incomplete_clause("今天车很多。", "zh"));
+
+        // English does not hold
+        assert!(!ends_with_incomplete_clause("So we are", "en"));
+    }
+
+    #[test]
+    fn stitch_clause_text_joins_cjk_directly_and_keeps_spaces_elsewhere() {
+        assert_eq!(
+            stitch_clause_text("車がガタガタなので", "ゆっくり走っています", "ja"),
+            "車がガタガタなのでゆっくり走っています"
+        );
+        assert_eq!(
+            stitch_clause_text("正在开车所以", "开得很慢", "zh"),
+            "正在开车所以开得很慢"
+        );
+        assert_eq!(
+            stitch_clause_text("천천히 가고 있는데", "조심하세요", "ko"),
+            "천천히 가고 있는데 조심하세요"
+        );
+        assert_eq!(
+            stitch_clause_text("So we are", "driving slowly", "en"),
+            "So we are driving slowly"
         );
     }
 }
